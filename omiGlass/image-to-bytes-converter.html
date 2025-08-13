@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Image to Bytes Converter for OpenGlass Testing</title>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; }
+        .container { max-width: 600px; margin: 0 auto; }
+        .output { background: #f5f5f5; padding: 15px; margin: 10px 0; border-radius: 5px; }
+        .bytes { font-family: monospace; word-break: break-all; }
+        button { padding: 10px 20px; margin: 5px; background: #4CAF50; color: white; border: none; border-radius: 5px; cursor: pointer; }
+        input[type="file"] { margin: 10px 0; }
+        img { max-width: 300px; max-height: 300px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔧 Image to Bytes Converter for OpenGlass</h1>
+        <p>Convert images to byte format for nRF Connect testing</p>
+        
+        <input type="file" id="fileInput" accept="image/*">
+        <br>
+        
+        <div id="preview"></div>
+        
+        <div class="output">
+            <h3>📦 Packet Instructions for nRF Connect:</h3>
+            <div id="instructions"></div>
+        </div>
+        
+        <div class="output">
+            <h3>🔢 Raw Bytes (for manual entry):</h3>
+            <div id="hexOutput" class="bytes"></div>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('fileInput').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+            
+            // Preview the image
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                document.getElementById('preview').innerHTML = 
+                    `<img src="${e.target.result}" alt="Preview"><br><strong>File:</strong> ${file.name} (${file.size} bytes)`;
+            };
+            reader.readAsDataURL(file);
+            
+            // Convert to bytes
+            const arrayReader = new FileReader();
+            arrayReader.onload = function(e) {
+                const arrayBuffer = e.target.result;
+                const bytes = new Uint8Array(arrayBuffer);
+                
+                // Generate packet instructions
+                const packets = [];
+                const maxPacketSize = 18; // 20 bytes - 2 bytes for packet ID = 18 bytes data per packet
+                let packetId = 0;
+                
+                for (let i = 0; i < bytes.length; i += maxPacketSize) {
+                    const chunk = bytes.slice(i, i + maxPacketSize);
+                    const packetIdBytes = [(packetId & 0xFF), (packetId >> 8) & 0xFF];
+                    const fullPacket = [...packetIdBytes, ...chunk];
+                    packets.push({
+                        id: packetId,
+                        hex: fullPacket.map(b => b.toString(16).padStart(2, '0')).join(' '),
+                        size: fullPacket.length
+                    });
+                    packetId++;
+                }
+                
+                // Generate instructions
+                let instructions = `
+                    <strong>Total packets needed:</strong> ${packets.length + 1} (${packets.length} data + 1 end marker)<br>
+                    <strong>Original image size:</strong> ${bytes.length} bytes<br><br>
+                    
+                    <strong>📱 nRF Connect Steps:</strong><br>
+                    1. Connect to your computer's OpenGlass service<br>
+                    2. Find characteristic: 19b10005-e8f2-537e-4f6c-d104768a1214<br>
+                    3. Send these packets in order:<br><br>
+                `;
+                
+                // Add first few packets as examples
+                for (let i = 0; i < Math.min(3, packets.length); i++) {
+                    instructions += `<strong>Packet ${i + 1}:</strong> <code>${packets[i].hex}</code><br>`;
+                }
+                
+                if (packets.length > 3) {
+                    instructions += `<em>... (${packets.length - 3} more packets) ...</em><br>`;
+                }
+                
+                instructions += `<strong>End Marker:</strong> <code>FF FF</code><br><br>`;
+                instructions += `<strong>🎯 Quick Test:</strong> For quick testing, use a small image (&lt;100 bytes) to reduce packets.`;
+                
+                document.getElementById('instructions').innerHTML = instructions;
+                
+                // Show raw hex for manual copying
+                const allHex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join(' ');
+                document.getElementById('hexOutput').innerHTML = allHex;
+            };
+            arrayReader.readAsArrayBuffer(file);
+        });
+    </script>
+</body>
+</html>

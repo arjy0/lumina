@@ -1,68 +1,70 @@
 import * as React from 'react';
 import { AsyncLock } from "../utils/lock";
-import { imageDescription, llamaFind } from "./imageDescription";
-import { startAudio } from '../modules/openai';
+import { startAudio } from '../modules/groq';
+import { groqVisionChat, groqTextChat } from '../modules/groqVision';
 
 type AgentState = {
-    lastDescription?: string;
     answer?: string;
     loading: boolean;
 }
 
 export class Agent {
     #lock = new AsyncLock();
-    #photos: { photo: Uint8Array, description: string }[] = [];
+    #photos: Uint8Array[] = [];
     #state: AgentState = { loading: false };
     #stateCopy: AgentState = { loading: false };
     #stateListeners: (() => void)[] = [];
 
     async addPhoto(photos: Uint8Array[]) {
         await this.#lock.inLock(async () => {
-
-            // Append photos
-            let lastDescription: string | null = null;
-            for (let p of photos) {
-                console.log('Processing photo', p.length);
-                let description = await imageDescription(p);
-                console.log('Description', description);
-                this.#photos.push({ photo: p, description });
-                lastDescription = description;
-            }
-
-            // TODO: Update summaries
-
-            // Update UI
-            if (lastDescription) {
-                this.#state.lastDescription = lastDescription;
-                this.#notify();
-            }
+            // Clear previous photos and add new ones
+            console.log('Adding photos:', photos.length, '(clearing previous', this.#photos.length, 'photos)');
+            this.#photos = [...photos]; // Replace instead of append
+            this.#notify();
         });
     }
 
-    async answer(question: string) {
+    async answer(question: string): Promise<string> {
         try {
             startAudio()
         } catch(error) {
             console.log("Failed to start audio")
         }
         if (this.#state.loading) {
-            return;
+            return this.#state.answer || "I'm still processing your previous question.";
         }
         this.#state.loading = true;
         this.#notify();
+        
+        let answer: string = "";
+        
         await this.#lock.inLock(async () => {
-            let combined = '';
-            let i = 0;
-            for (let p of this.#photos) {
-                combined + '\n\nImage #' + i + '\n\n';
-                combined += p.description;
-                i++;
+            if (this.#photos.length > 0) {
+                // Use direct vision model with images
+                console.log('🖼️ Using vision model with', this.#photos.length, 'images');
+                answer = await groqVisionChat(question, this.#photos);
+                console.log('🎯 Vision model returned:', answer);
+            } else {
+                // Fallback to text-only model
+                console.log('💬 Using text model (no images)');
+                answer = await groqTextChat(
+                    "You are a helpful AI assistant for smart glasses.",
+                    question
+                );
+                console.log('🎯 Text model returned:', answer);
             }
-            let answer = await llamaFind(question, combined);
+            
+            console.log('📝 Setting agent state answer to:', answer);
             this.#state.answer = answer;
             this.#state.loading = false;
+            console.log('📊 Agent state after update:', { 
+                answer: this.#state.answer, 
+                loading: this.#state.loading 
+            });
             this.#notify();
         });
+        
+        return answer;
     }
 
     #notify = () => {
