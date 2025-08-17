@@ -7,6 +7,7 @@
 #include "esp_camera.h"
 #include "esp_sleep.h"
 #include "config.h"  // Use config.h for all configurations
+#include <driver/i2s.h>  // Add I2S support for microphone
 
 // Battery state
 float batteryVoltage = 0.0f;
@@ -22,6 +23,14 @@ volatile bool buttonPressed = false;
 unsigned long buttonPressTime = 0;
 led_status_t ledMode = LED_BOOT_SEQUENCE;
 
+// Touch sensor state
+touch_state_t touchState = TOUCH_IDLE;
+unsigned long lastTouchTime = 0;
+unsigned long touchRecordingStartTime = 0;
+unsigned long lastSpeechTime = 0;          // Last time we detected speech during touch recording
+unsigned long silenceStartTime = 0;       // When current silence period started
+bool touchActivationMode = true;  // Always enabled for hardware-only operation
+
 // Gentle power optimization
 unsigned long lastActivity = 0;
 bool powerSaveMode = false;
@@ -29,9 +38,54 @@ bool powerSaveMode = false;
 // Light sleep optimization - saves ~15mA = adds 3-4 hours battery life
 bool lightSleepEnabled = true;
 
-// ---------------------------------------------------------------------------------
-// BLE - Using config.h definitions
-// ---------------------------------------------------------------------------------
+// Camera state
+camera_fb_t *fb = nullptr;
+bool cameraInitialized = false;
+
+// Microphone state and configuration
+#define I2S_WS MICROPHONE_WS_PIN       // Word Select (LRCLK) - GPIO42 (from config.h)
+#define I2S_SD MICROPHONE_SD_PIN       // Serial Data (DIN) - GPIO41 (from config.h)
+#define I2S_SCK -1                     // Serial Clock NOT USED in PDM mode
+#define I2S_PORT MICROPHONE_I2S_PORT   // MUST use I2S_NUM_0 - PDM only works on I2S0
+#define I2S_SAMPLE_RATE MICROPHONE_SAMPLE_RATE
+#define I2S_SAMPLE_BITS MICROPHONE_BITS_PER_SAMPLE
+#define I2S_CHANNEL_NUM 1
+#define I2S_READ_LEN MICROPHONE_BUFFER_SIZE    // Buffer size for audio capture (from config.h)
+#define AUDIO_BUFFER_SIZE (2048)               // Buffer for BLE transmission
+#define TOUCH_AUDIO_MAX_BYTES (192000)         // Max ~6s @16kHz mono 16-bit (16000*2*6=192000) for longer speech
+
+bool microphoneInitialized = false;
+bool voiceActivationEnabled = false;
+bool listeningForWakeWord = false;
+bool recordingCommand = false;
+float currentAudioLevel = 0.0f;
+float peakAudioLevel = 0.0f;
+float previousSample = 0.0f;  // For high-pass filter
+unsigned long lastMicrophoneActivity = 0;
+
+// Audio buffers
+int16_t audioBuffer[I2S_READ_LEN];
+uint8_t bleAudioBuffer[AUDIO_BUFFER_SIZE];
+static uint8_t touchAudioAccum[TOUCH_AUDIO_MAX_BYTES];
+static size_t touchAudioAccumIndex = 0;
+size_t audioBufferIndex = 0;
+
+// Function declarations for enhanced wake word detection
+bool configureMicrophone();
+void processAudio();
+bool detectWakeWord(int16_t* samples, size_t sampleCount);
+bool detectSpeechActivity(int16_t* samples, size_t sampleCount);
+float getDominantFrequency(int16_t* samples, size_t sampleCount);
+bool isLuminaPattern(float* freqHistory, int historyLen);
+
+// Touch sensor functions
+void initializeTouchSensor();
+void handleTouchSensor();
+bool isTouchDetected();
+
+// BLE state
+BLEServer *pServer = nullptr;
+BLEService *pService = nullptr;
 
 // Device Information Service UUIDs  
 #define DEVICE_INFORMATION_SERVICE_UUID (uint16_t)0x180A
@@ -45,10 +99,17 @@ static BLEUUID serviceUUID(OMI_SERVICE_UUID);
 static BLEUUID photoDataUUID(PHOTO_DATA_UUID);
 static BLEUUID photoControlUUID(PHOTO_CONTROL_UUID);
 
+// Audio service UUIDs - from config.h
+static BLEUUID audioDataUUID(AUDIO_DATA_UUID);
+static BLEUUID audioControlUUID(AUDIO_CONTROL_UUID);
+
+
 // Characteristics
 BLECharacteristic *photoDataCharacteristic;
 BLECharacteristic *photoControlCharacteristic;
 BLECharacteristic *batteryLevelCharacteristic;
+BLECharacteristic *audioDataCharacteristic;
+BLECharacteristic *audioControlCharacteristic;
 
 // State
 bool connected = false;
@@ -60,13 +121,9 @@ size_t sent_photo_bytes = 0;
 size_t sent_photo_frames = 0;
 bool photoDataUploading = false;
 
-// -------------------------------------------------------------------------
-// Camera Frame
-// -------------------------------------------------------------------------
-camera_fb_t *fb = nullptr;
-
 // Forward declarations
 void handlePhotoControl(int8_t controlValue);
+void handleAudioControl(int8_t controlValue);
 void readBatteryLevel();
 void updateBatteryService();
 void IRAM_ATTR buttonISR();
@@ -77,6 +134,30 @@ void enterPowerSave();
 void exitPowerSave();
 void shutdownDevice();
 void enableLightSleep();
+void processAudio();
+void startVoiceActivation();
+void stopVoiceActivation();
+void startRecordingCommand();
+void sendAudioData(uint8_t* audioData, size_t length);
+
+// -------------------------------------------------------------------------
+// BLE Callback Classes (Forward Declarations)
+// -------------------------------------------------------------------------
+class ServerCallbacks: public BLEServerCallbacks {
+public:
+  void onConnect(BLEServer* pServer);
+  void onDisconnect(BLEServer* pServer);
+};
+
+class PhotoControlCallbacks: public BLECharacteristicCallbacks {
+public:
+  void onWrite(BLECharacteristic *pCharacteristic);
+};
+
+class AudioControlCallbacks: public BLECharacteristicCallbacks {
+public:
+  void onWrite(BLECharacteristic *pCharacteristic);
+};
 
 // -------------------------------------------------------------------------
 // Button ISR
@@ -352,86 +433,6 @@ void updateBatteryService() {
 }
 
 // -------------------------------------------------------------------------
-// configure_ble()
-// -------------------------------------------------------------------------
-void configure_ble() {
-  Serial.println("Initializing BLE...");
-  BLEDevice::init(BLE_DEVICE_NAME);
-  BLEServer *server = BLEDevice::createServer();
-  server->setCallbacks(new ServerHandler());
-
-  // Main service
-  BLEService *service = server->createService(serviceUUID);
-
-  // Photo Data characteristic
-  photoDataCharacteristic = service->createCharacteristic(
-      photoDataUUID,
-      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-  BLE2902 *ccc = new BLE2902();
-  ccc->setNotifications(true);
-  photoDataCharacteristic->addDescriptor(ccc);
-
-  // Photo Control characteristic
-  photoControlCharacteristic = service->createCharacteristic(
-      photoControlUUID,
-      BLECharacteristic::PROPERTY_WRITE);
-  photoControlCharacteristic->setCallbacks(new PhotoControlCallback());
-  uint8_t controlValue = 0;
-  photoControlCharacteristic->setValue(&controlValue, 1);
-
-  // Battery Service
-  BLEService *batteryService = server->createService(BATTERY_SERVICE_UUID);
-  batteryLevelCharacteristic = batteryService->createCharacteristic(
-      BATTERY_LEVEL_UUID,
-      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-  BLE2902 *batteryCcc = new BLE2902();
-  batteryCcc->setNotifications(true);
-  batteryLevelCharacteristic->addDescriptor(batteryCcc);
-  
-  // Set initial battery level
-  readBatteryLevel();
-  uint8_t initialBatteryLevel = (uint8_t)batteryPercentage;
-  batteryLevelCharacteristic->setValue(&initialBatteryLevel, 1);
-
-  // Device Information Service
-  BLEService *deviceInfoService = server->createService(DEVICE_INFORMATION_SERVICE_UUID);
-  BLECharacteristic *manufacturerNameCharacteristic =
-      deviceInfoService->createCharacteristic(MANUFACTURER_NAME_STRING_CHAR_UUID,
-                                              BLECharacteristic::PROPERTY_READ);
-  BLECharacteristic *modelNumberCharacteristic =
-      deviceInfoService->createCharacteristic(MODEL_NUMBER_STRING_CHAR_UUID,
-                                              BLECharacteristic::PROPERTY_READ);
-  BLECharacteristic *firmwareRevisionCharacteristic =
-      deviceInfoService->createCharacteristic(FIRMWARE_REVISION_STRING_CHAR_UUID,
-                                              BLECharacteristic::PROPERTY_READ);
-  BLECharacteristic *hardwareRevisionCharacteristic =
-      deviceInfoService->createCharacteristic(HARDWARE_REVISION_STRING_CHAR_UUID,
-                                              BLECharacteristic::PROPERTY_READ);
-
-  manufacturerNameCharacteristic->setValue(MANUFACTURER_NAME);
-  modelNumberCharacteristic->setValue(BLE_DEVICE_NAME);
-  firmwareRevisionCharacteristic->setValue(FIRMWARE_VERSION_STRING);
-  hardwareRevisionCharacteristic->setValue(HARDWARE_REVISION);
-
-  // Start services
-  service->start();
-  batteryService->start();
-  deviceInfoService->start();
-
-  // Start advertising
-  BLEAdvertising *advertising = BLEDevice::getAdvertising();
-  advertising->addServiceUUID(deviceInfoService->getUUID());
-  advertising->addServiceUUID(service->getUUID());
-  advertising->addServiceUUID(batteryService->getUUID());
-  advertising->setScanResponse(true);
-  advertising->setMinPreferred(BLE_ADV_MIN_INTERVAL);
-  advertising->setMaxPreferred(BLE_ADV_MAX_INTERVAL);
-  BLEDevice::startAdvertising();
-
-  Serial.println("BLE initialized and advertising started.");
-}
-
-// -------------------------------------------------------------------------
 // Camera
 // -------------------------------------------------------------------------
 bool take_photo() {
@@ -459,17 +460,46 @@ bool take_photo() {
 void handlePhotoControl(int8_t controlValue) {
   if (controlValue == -1) {
     Serial.println("Received command: Single photo.");
+    // Reset transmission state for fresh capture
+    photoDataUploading = false;
+    sent_photo_bytes = 0;
+    sent_photo_frames = 0;
+    // Free any existing buffer
+    if (fb) {
+      esp_camera_fb_return(fb);
+      fb = nullptr;
+    }
     isCapturingPhotos = true;
     captureInterval = 0;
   }
   else if (controlValue == 0) {
     Serial.println("Received command: Stop photo capture.");
+    // Reset all transmission state
     isCapturingPhotos = false;
+    photoDataUploading = false;
+    sent_photo_bytes = 0;
+    sent_photo_frames = 0;
     captureInterval = 0;
+    // Free any existing buffer
+    if (fb) {
+      esp_camera_fb_return(fb);
+      fb = nullptr;
+      Serial.println("Freed existing camera buffer on STOP command.");
+    }
   }
   else if (controlValue >= 5 && controlValue <= 300) {
     Serial.print("Received command: Start interval capture with parameter ");
     Serial.println(controlValue);
+
+    // Reset transmission state for fresh capture
+    photoDataUploading = false;
+    sent_photo_bytes = 0;
+    sent_photo_frames = 0;
+    // Free any existing buffer
+    if (fb) {
+      esp_camera_fb_return(fb);
+      fb = nullptr;
+    }
 
     // Use fixed interval from config for optimal battery life
     captureInterval = PHOTO_CAPTURE_INTERVAL_MS;
@@ -502,8 +532,8 @@ void configure_camera() {
   config.pin_pclk     = PCLK_GPIO_NUM;
   config.pin_vsync    = VSYNC_GPIO_NUM;
   config.pin_href     = HREF_GPIO_NUM;
-  config.pin_sscb_sda = SIOD_GPIO_NUM;
-  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
   config.xclk_freq_hz = CAMERA_XCLK_FREQ;
@@ -519,9 +549,586 @@ void configure_camera() {
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed with error 0x%x\n", err);
+    cameraInitialized = false;
   }
   else {
     Serial.println("Camera initialized successfully.");
+    cameraInitialized = true;
+  }
+}
+
+// -------------------------------------------------------------------------
+// configure_microphone()
+// -------------------------------------------------------------------------
+bool configureMicrophone() {
+  Serial.println("Initializing microphone...");
+  
+  // Check if I2S driver is already installed before uninstalling
+  // Note: i2s_driver_uninstall will give an error if not installed, but it's harmless
+  esp_err_t uninstall_result = i2s_driver_uninstall(I2S_PORT);
+  if (uninstall_result == ESP_OK) {
+    Serial.println("Previous I2S driver uninstalled");
+  } else {
+    Serial.println("No previous I2S driver to uninstall (expected)");
+  }
+  delay(100);
+  
+  // I2S configuration for XIAO ESP32S3 Sense built-in microphone (PDM mode)
+  // Based on official Seeed Studio examples
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM),  // PDM mode
+    .sample_rate = I2S_SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,       // Mono microphone
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 4,                                 // Back to 4 as in Seeed examples
+    .dma_buf_len = 1024,                                // Back to 1024 as in Seeed examples
+    .use_apll = false,                                  // Back to false as in Seeed examples
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+  };
+
+  // I2S pin configuration for PDM mode
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_PIN_NO_CHANGE,    // BCK not used in PDM mode
+    .ws_io_num = I2S_WS,                // Clock pin for PDM (GPIO42)
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_SD               // Data pin for PDM (GPIO41)
+  };
+
+  // Install I2S driver
+  esp_err_t err = i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+  if (err != ESP_OK) {
+    Serial.printf("❌ I2S driver install failed: %s\n", esp_err_to_name(err));
+    microphoneInitialized = false;
+    return false;
+  }
+
+  // Set pins
+  err = i2s_set_pin(I2S_PORT, &pin_config);
+  if (err != ESP_OK) {
+    Serial.printf("❌ I2S pin config failed: %s\n", esp_err_to_name(err));
+    i2s_driver_uninstall(I2S_PORT);
+    microphoneInitialized = false;
+    return false;
+  }
+
+  // Clear buffer and stabilize
+  i2s_zero_dma_buffer(I2S_PORT);
+  delay(200);
+  
+  // Test read
+  int16_t test_buffer[64];
+  size_t bytes_read = 0;
+  esp_err_t test_result = i2s_read(I2S_PORT, test_buffer, sizeof(test_buffer), &bytes_read, 1000);
+  
+  if (test_result == ESP_OK && bytes_read > 0) {
+    Serial.printf("✅ Microphone initialized successfully - read %d bytes\n", bytes_read);
+    microphoneInitialized = true;
+    return true;
+  } else {
+    Serial.printf("❌ Microphone test failed: %s\n", esp_err_to_name(test_result));
+    microphoneInitialized = false;
+    return false;
+  }
+}
+
+// -------------------------------------------------------------------------
+// configure_ble()
+// -------------------------------------------------------------------------
+void configure_ble() {
+  Serial.println("Initializing BLE...");
+  
+  // Initialize BLE
+  BLEDevice::init(BLE_DEVICE_NAME);
+  
+  // Create BLE Server
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+  
+  // Create BLE Service
+  pService = pServer->createService(serviceUUID);
+  
+  // Create Photo Data Characteristic
+  photoDataCharacteristic = pService->createCharacteristic(
+    photoDataUUID,
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+  );
+  photoDataCharacteristic->addDescriptor(new BLE2902());
+  
+  // Create Photo Control Characteristic
+  photoControlCharacteristic = pService->createCharacteristic(
+    photoControlUUID,
+    BLECharacteristic::PROPERTY_WRITE
+  );
+  photoControlCharacteristic->setCallbacks(new PhotoControlCallbacks());
+  
+  // Create Audio Data Characteristic  
+  audioDataCharacteristic = pService->createCharacteristic(
+    audioDataUUID,
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+  );
+  audioDataCharacteristic->addDescriptor(new BLE2902());
+  
+  // Create Audio Control Characteristic
+  audioControlCharacteristic = pService->createCharacteristic(
+    audioControlUUID,
+    BLECharacteristic::PROPERTY_WRITE
+  );
+  audioControlCharacteristic->setCallbacks(new AudioControlCallbacks());
+  
+  // Create Battery Level Characteristic
+  BLEService *batteryService = pServer->createService(BLEUUID((uint16_t)BATTERY_SERVICE_UUID));
+  batteryLevelCharacteristic = batteryService->createCharacteristic(
+    BLEUUID((uint16_t)BATTERY_LEVEL_UUID),
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+  );
+  batteryLevelCharacteristic->addDescriptor(new BLE2902());
+  
+  // Start services
+  pService->start();
+  batteryService->start();
+  
+  // Start advertising
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(serviceUUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);  // functions that help with iPhone connections issue
+  pAdvertising->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
+  
+  Serial.println("BLE initialized and advertising started");
+}
+
+// -------------------------------------------------------------------------
+// BLE Callback Method Implementations
+// -------------------------------------------------------------------------
+void ServerCallbacks::onConnect(BLEServer* pServer) {
+  connected = true;
+  Serial.println("BLE client connected");
+  lastActivity = millis();
+}
+
+void ServerCallbacks::onDisconnect(BLEServer* pServer) {
+  connected = false;
+  Serial.println("BLE client disconnected");
+  delay(500); // give the bluetooth stack the chance to get things ready
+  pServer->startAdvertising(); // restart advertising
+  Serial.println("BLE advertising restarted");
+}
+
+void PhotoControlCallbacks::onWrite(BLECharacteristic *pCharacteristic) {
+  std::string value = pCharacteristic->getValue();
+  if (value.length() > 0) {
+    int8_t controlValue = value[0];
+    handlePhotoControl(controlValue);
+  }
+}
+
+void AudioControlCallbacks::onWrite(BLECharacteristic *pCharacteristic) {
+  std::string value = pCharacteristic->getValue();
+  if (value.length() > 0) {
+    int8_t controlValue = value[0];
+    handleAudioControl(controlValue);
+  }
+}
+
+// -------------------------------------------------------------------------
+// Audio Processing Functions
+// -------------------------------------------------------------------------
+
+// Handle audio control commands from mobile app
+void handleAudioControl(int8_t controlValue) {
+  switch (controlValue) {
+    case 1:  // Start voice activation
+      Serial.println("🎤 Starting voice activation...");
+      startVoiceActivation();
+      break;
+    case 0:  // Stop voice activation  
+      Serial.println("🛑 Stopping voice activation...");
+      stopVoiceActivation();
+      break;
+    case 2:  // Start recording command
+      Serial.println("📝 Starting command recording...");
+      startRecordingCommand();
+      break;
+    default:
+      Serial.printf("⚠️ Unknown audio control: %d\n", controlValue);
+      break;
+  }
+}
+
+// Start voice activation (listen for wake word)
+void startVoiceActivation() {
+  if (!microphoneInitialized) {
+    Serial.println("❌ Microphone not initialized");
+    return;
+  }
+  
+  voiceActivationEnabled = true;
+  listeningForWakeWord = false;  // Disabled - using touch activation instead
+  recordingCommand = false;
+  audioBufferIndex = 0;
+  
+  Serial.println("🎤 Voice activation ready - using TOUCH sensor (wake word disabled)");
+}
+
+// Stop voice activation
+void stopVoiceActivation() {
+  voiceActivationEnabled = false;
+  listeningForWakeWord = false;
+  recordingCommand = false;
+  audioBufferIndex = 0;
+  
+  Serial.println("🛑 Voice activation stopped");
+}
+
+// Start recording voice command after wake word detected
+void startRecordingCommand() {
+  if (!voiceActivationEnabled) {
+    Serial.println("❌ Voice activation not enabled");
+    return;
+  }
+  
+  listeningForWakeWord = false;
+  recordingCommand = true;
+  audioBufferIndex = 0;
+  
+  Serial.println("📝 Recording voice command...");
+}
+
+// Enhanced wake word detection for "Lumina" using spectral analysis
+bool detectWakeWord(int16_t* samples, size_t sampleCount) {
+  // Calculate DC offset (average value) to remove bias
+  float dcOffset = 0.0f;
+  for (size_t i = 0; i < sampleCount; i++) {
+    dcOffset += (float)samples[i];
+  }
+  dcOffset = dcOffset / sampleCount;
+  
+  // Calculate AC energy after removing DC offset and applying high-pass filter
+  float acEnergy = 0.0f;
+  int16_t minSample = 32767, maxSample = -32768;
+  int validSampleCount = 0;
+  
+  for (size_t i = 0; i < sampleCount; i++) {
+    // Remove DC offset to get AC component
+    float acSample = (float)samples[i] - dcOffset;
+    
+    // Simple high-pass filter to remove low-frequency noise
+    float filteredSample = acSample - (previousSample * 0.95f);
+    previousSample = acSample;
+    
+    // Convert back to int16 and apply gain
+    int16_t processedSample = (int16_t)(filteredSample * 16.0f);  // 16x amplification
+    
+    // Only count significant samples
+    if (abs(processedSample) > 50) {
+      acEnergy += (float)(processedSample * processedSample);
+      if (processedSample < minSample) minSample = processedSample;
+      if (processedSample > maxSample) maxSample = processedSample;
+      validSampleCount++;
+    }
+  }
+  
+  if (validSampleCount > 5) {  // Need at least some valid samples
+    acEnergy = acEnergy / validSampleCount;
+    currentAudioLevel = sqrtf(acEnergy) / 32768.0f * 100.0f; // Convert to percentage
+  } else {
+    currentAudioLevel = 0.0f;
+  }
+  
+  // Update peak level
+  if (currentAudioLevel > peakAudioLevel) {
+    peakAudioLevel = currentAudioLevel;
+  }
+  
+  // Debug audio levels with DC offset info
+  static unsigned long lastLevelDebug = 0;
+  if (millis() - lastLevelDebug > 2000) {  // Every 2 seconds
+    Serial.printf("🔊 Audio Level: %.1f%% | Peak: %.1f%% | DC Offset: %.0f | AC Range: %d to %d | Valid: %d/%d\n", 
+                  currentAudioLevel, peakAudioLevel, dcOffset, minSample, maxSample, validSampleCount, sampleCount);
+    lastLevelDebug = millis();
+  }
+  
+  // Enhanced "Lumina" detection algorithm
+  static int consecutiveHighEnergy = 0;
+  static unsigned long lastWakeWordTime = 0;
+  static float freqHistory[10] = {0}; // Store frequency characteristics
+  static int historyIndex = 0;
+  
+  // Voice Activity Detection (VAD) - detect if it's speech vs noise
+  bool isSpeech = detectSpeechActivity(samples, sampleCount);
+  
+  // Higher threshold and require actual speech characteristics
+  if (currentAudioLevel > 6.0f && isSpeech) {  // Lowered from 8.0f to 6.0f
+    consecutiveHighEnergy++;
+    
+    // Analyze frequency content for "Lumina" pattern
+    float dominantFreq = getDominantFrequency(samples, sampleCount);
+    freqHistory[historyIndex % 10] = dominantFreq;
+    historyIndex++;
+    
+    // Only log when we have meaningful speech (not background noise)
+    if (dominantFreq > 0) {
+      Serial.printf("🎯 Speech detected: %.1f%% | Freq: %.0fHz (consecutive: %d)\n", 
+                    currentAudioLevel, dominantFreq, consecutiveHighEnergy);
+    }
+    
+    // "Lumina" has specific phonetic pattern: Lu-mi-na (3 syllables)
+    // Look for syllable pattern and frequency characteristics  
+    if (consecutiveHighEnergy >= 2 && consecutiveHighEnergy <= 8) { // Lowered minimum from 3 to 2
+      if (isLuminaPattern(freqHistory, historyIndex) && (millis() - lastWakeWordTime > 2000)) {
+        lastWakeWordTime = millis();
+        consecutiveHighEnergy = 0;
+        historyIndex = 0;
+        Serial.println("🎉 LUMINA DETECTED!");
+        return true;
+      }
+    }
+    
+    // Reset if too long (probably not "Lumina")
+    if (consecutiveHighEnergy > 10) { // Shortened from 15 to 10
+      consecutiveHighEnergy = 0;
+      historyIndex = 0;
+    }
+  } else {
+    // Gradual decay instead of immediate reset
+    if (consecutiveHighEnergy > 0) {
+      consecutiveHighEnergy--;
+    }
+  }
+  
+  return false;
+}
+
+// Detect if audio contains speech characteristics vs noise (improved)
+bool detectSpeechActivity(int16_t* samples, size_t sampleCount) {
+  // Calculate overall energy first
+  float totalEnergy = 0.0f;
+  for (size_t i = 0; i < sampleCount; i++) {
+    totalEnergy += (float)(samples[i] * samples[i]);
+  }
+  totalEnergy = totalEnergy / sampleCount;
+  
+  // If energy is too low, it's just noise
+  if (totalEnergy < 20000000.0f) { // Lowered threshold for noise rejection
+    return false;
+  }
+  
+  // Simple spectral centroid analysis for speech detection
+  float lowFreqEnergy = 0.0f;   // 300-1000Hz (vowels)
+  float midFreqEnergy = 0.0f;   // 1000-3000Hz (consonants)
+  float highFreqEnergy = 0.0f;  // 3000-8000Hz (sibilants)
+  
+  // Simple frequency analysis (not perfect FFT, but lightweight)
+  for (size_t i = 1; i < sampleCount/4; i++) {
+    float sample1 = (float)samples[i-1];
+    float sample2 = (float)samples[i];
+    float diff = abs(sample2 - sample1);
+    
+    if (i < sampleCount/12) lowFreqEnergy += diff;      // Low freq approximation
+    else if (i < sampleCount/6) midFreqEnergy += diff;  // Mid freq approximation  
+    else highFreqEnergy += diff;                        // High freq approximation
+  }
+  
+  // Speech typically has more energy in mid frequencies
+  float totalSpectralEnergy = lowFreqEnergy + midFreqEnergy + highFreqEnergy;
+  if (totalSpectralEnergy < 5000) return false; // Too quiet spectral content
+  
+  float midRatio = midFreqEnergy / totalSpectralEnergy;
+  return (midRatio > 0.2f && midRatio < 0.8f); // Speech characteristic ranges
+}
+
+// Get dominant frequency (improved)
+float getDominantFrequency(int16_t* samples, size_t sampleCount) {
+  // Zero-crossing rate analysis (simpler than FFT)
+  int zeroCrossings = 0;
+  int threshold = 1000; // Noise threshold to avoid counting noise as crossings
+  
+  for (size_t i = 1; i < sampleCount; i++) {
+    // Only count significant zero crossings (above noise floor)
+    if (abs(samples[i]) > threshold || abs(samples[i-1]) > threshold) {
+      if ((samples[i-1] >= 0 && samples[i] < 0) || (samples[i-1] < 0 && samples[i] >= 0)) {
+        zeroCrossings++;
+      }
+    }
+  }
+  
+  // Estimate frequency from zero-crossing rate
+  float frequency = (float)zeroCrossings * MICROPHONE_SAMPLE_RATE / (2.0f * sampleCount);
+  
+  // Filter out unrealistic frequencies for human speech
+  if (frequency < 50.0f || frequency > 4000.0f) {
+    return 0.0f;
+  }
+  
+  return frequency;
+}
+
+// Analyze if frequency pattern matches "Lumina" phonetics (improved)
+bool isLuminaPattern(float* freqHistory, int historyLen) {
+  if (historyLen < 2) return false; // Lowered from 3 to 2
+  
+  // "Lumina" phonetic analysis:
+  // Lu- : vowel sound (200-600Hz) 
+  // -mi-: higher frequency consonant + vowel (300-800Hz)
+  // -na : nasal + vowel (250-650Hz)
+  
+  int recentSamples = min(historyLen, 4); // Reduced from 6 to 4
+  float avgFreq = 0.0f;
+  float minFreq = 10000.0f;
+  float maxFreq = 0.0f;
+  int validFreqCount = 0;
+  
+  for (int i = max(0, historyLen - recentSamples); i < historyLen; i++) {
+    int idx = i % 10;
+    if (freqHistory[idx] > 50.0f) { // Only count valid frequencies
+      avgFreq += freqHistory[idx];
+      validFreqCount++;
+      if (freqHistory[idx] > maxFreq) maxFreq = freqHistory[idx];
+      if (freqHistory[idx] < minFreq) minFreq = freqHistory[idx];
+    }
+  }
+  
+  if (validFreqCount < 1) return false; // Only need 1 valid sample now
+  avgFreq /= validFreqCount;
+  
+  // "Lumina" characteristics (very lenient):
+  // 1. Average frequency in human speech range (100-1200Hz)
+  // 2. Some frequency variation OR consistent speech frequency
+  // 3. In realistic speech range
+  bool goodAvgFreq = (avgFreq >= 100.0f && avgFreq <= 1200.0f);
+  bool hasVariation = (maxFreq - minFreq) >= 50.0f; // Reduced from 80Hz
+  bool inSpeechRange = (maxFreq < 2500.0f && minFreq > 50.0f);
+  bool consistentSpeech = (validFreqCount >= 1 && avgFreq > 200.0f); // New: allow consistent speech
+  
+  if (goodAvgFreq && (hasVariation || consistentSpeech) && inSpeechRange) {
+    Serial.printf("🎶 Lumina pattern match: avg=%.0fHz, range=%.0f-%.0fHz (samples=%d)\n", 
+                  avgFreq, minFreq, maxFreq, validFreqCount);
+    return true;
+  }
+  
+  return false;
+}
+
+// Send audio data via BLE
+void sendAudioData(uint8_t* audioData, size_t length) {
+  if (!connected || !audioDataCharacteristic) {
+    return;
+  }
+  
+  // Send in chunks (BLE MTU limitations)
+  const size_t chunkSize = 200;
+  for (size_t offset = 0; offset < length; offset += chunkSize) {
+    size_t currentChunkSize = min(chunkSize, length - offset);
+    
+    // Create packet with frame index
+    uint8_t packet[202];
+    packet[0] = (offset / chunkSize) & 0xFF;  // Frame index low byte
+    packet[1] = ((offset / chunkSize) >> 8) & 0xFF;  // Frame index high byte
+    memcpy(&packet[2], &audioData[offset], currentChunkSize);
+    
+    audioDataCharacteristic->setValue(packet, currentChunkSize + 2);
+    audioDataCharacteristic->notify();
+    
+    delay(10);  // Small delay between chunks
+  }
+}
+
+// Process audio samples
+void processAudio() {
+  if (!microphoneInitialized) {
+    // Only print this occasionally to avoid spam
+    static unsigned long lastWarning = 0;
+    if (millis() - lastWarning > 10000) {  // Every 10 seconds
+      Serial.println("⚠️ Audio processing skipped - microphone not initialized");
+      lastWarning = millis();
+    }
+    return;
+  }
+  
+  if (!voiceActivationEnabled) {
+    // Only print this occasionally to avoid spam  
+    static unsigned long lastWarning2 = 0;
+    if (millis() - lastWarning2 > 10000) {  // Every 10 seconds
+      Serial.println("⚠️ Audio processing skipped - voice activation not enabled");
+      lastWarning2 = millis();
+    }
+    return;
+  }
+  
+  size_t bytes_read = 0;
+  esp_err_t result = i2s_read(I2S_PORT, audioBuffer, sizeof(audioBuffer), &bytes_read, 0);
+  
+  if (result == ESP_OK && bytes_read > 0) {
+    size_t samples_read = bytes_read / sizeof(int16_t);
+    lastMicrophoneActivity = millis();
+    
+    // Debug audio activity occasionally
+    static unsigned long lastAudioDebug = 0;
+    if (millis() - lastAudioDebug > 5000) {  // Every 5 seconds
+      Serial.printf("🎤 Audio: %d bytes read, %d samples, listening=%s\n", 
+                    bytes_read, samples_read, listeningForWakeWord ? "YES" : "NO");
+      lastAudioDebug = millis();
+    }
+
+    // -----------------------------------------------------------------
+    // Unified audio level computation (mirrors microphone_test behavior)
+    // DC offset removal + gain + noise gate + RMS of AC component.
+    // Removed previous ad-hoc high-pass which was over-attenuating speech.
+    // -----------------------------------------------------------------
+    const float GAIN = 16.0f;        // Stronger gain so speech crosses threshold
+    const int NOISE_GATE = 100;      // Ignore tiny fluctuations
+
+    float dc_offset = 0.0f;
+    for (size_t i = 0; i < samples_read; ++i) dc_offset += (float)audioBuffer[i];
+    dc_offset /= (float)samples_read;
+
+    float sum_squares = 0.0f;
+    int16_t min_sample = 32767;
+    int16_t max_sample = -32768;
+    int valid_samples = 0;
+    for (size_t i = 0; i < samples_read; ++i) {
+      float ac = (float)audioBuffer[i] - dc_offset; // remove DC bias
+      int16_t proc = (int16_t)(ac * GAIN);
+      if (abs(proc) > NOISE_GATE) {
+        if (proc < min_sample) min_sample = proc;
+        if (proc > max_sample) max_sample = proc;
+        sum_squares += (float)proc * (float)proc;
+        valid_samples++;
+      }
+    }
+    if (valid_samples > 0) {
+      float rms = sqrtf(sum_squares / (float)valid_samples);
+      currentAudioLevel = (rms / 32768.0f) * 100.0f;
+    } else {
+      currentAudioLevel = 0.0f;
+    }
+    if (currentAudioLevel > peakAudioLevel) peakAudioLevel = currentAudioLevel;
+
+    // More frequent during calibration (every 1s)
+    static unsigned long lastLevelPrint = 0;
+    if (millis() - lastLevelPrint > 1000) {
+      Serial.printf("🔊 (core) Level=%.1f%% | Peak=%.1f%% | DC=%.0f | AC range %d..%d | valid=%d/%d\n",
+                    currentAudioLevel, peakAudioLevel, dc_offset, min_sample, max_sample, valid_samples, samples_read);
+      lastLevelPrint = millis();
+    }
+    
+    // Only process recording if touch-activated
+    if (recordingCommand && (touchState == TOUCH_RECORDING_ACTIVE || touchState == TOUCH_RECORDING_SILENCE)) {
+      // Touch recording: accumulate full session into large buffer
+      size_t bytesToCopy = min(sizeof(audioBuffer), (size_t)(TOUCH_AUDIO_MAX_BYTES - touchAudioAccumIndex));
+      if (bytesToCopy > 0) {
+        memcpy(&touchAudioAccum[touchAudioAccumIndex], audioBuffer, bytesToCopy);
+        touchAudioAccumIndex += bytesToCopy;
+        Serial.printf("🎤 Touch recording accumulating: +%u (total=%u / %u)\n", 
+                     (unsigned)bytesToCopy, (unsigned)touchAudioAccumIndex, (unsigned)TOUCH_AUDIO_MAX_BYTES);
+      } else {
+        Serial.println("⚠️ Touch audio buffer full - stopping accumulation");
+      }
+    }
   }
 }
 
@@ -555,6 +1162,19 @@ void setup_app() {
   
   configure_ble();
   configure_camera();
+  
+  // Initialize touch sensor for accessibility
+  Serial.println("=== INITIALIZING TOUCH SENSOR ===");
+  initializeTouchSensor();
+  Serial.println("✅ Touch sensor initialization complete!");
+  
+  // Initialize hardware microphone for voice activation
+  Serial.println("=== INITIALIZING MICROPHONE ===");
+  if (configureMicrophone()) {
+    Serial.println("✅ Microphone initialization successful!");
+  } else {
+    Serial.println("❌ Microphone initialization failed!");
+  }
 
   // Allocate buffer for photo chunks (200 bytes + 2 for frame index)
   s_compressed_frame_2 = (uint8_t *)ps_calloc(202, sizeof(uint8_t));
@@ -564,13 +1184,19 @@ void setup_app() {
     Serial.println("Chunk buffer allocated successfully.");
   }
 
-  // Set default capture interval from config
-  isCapturingPhotos = true;
-  captureInterval = PHOTO_CAPTURE_INTERVAL_MS;
-  lastCaptureTime = millis() - captureInterval;
-  Serial.print("Default capture interval set to ");
-  Serial.print(PHOTO_CAPTURE_INTERVAL_MS / 1000);
-  Serial.println(" seconds.");
+  // VOICE-ACTIVATED ONLY - No automatic photo capture
+  isCapturingPhotos = false;  // Only capture when wake word detected
+  captureInterval = 0;        // No interval-based capture
+  lastCaptureTime = 0;
+  Serial.println("Voice activation enabled - photos will only be captured when 'Lumina' is detected");
+  
+  // Start listening for wake word if microphone is initialized
+  if (microphoneInitialized) {
+    startVoiceActivation();
+    Serial.println("Hardware voice activation started - listening for 'Lumina'");
+  } else {
+    Serial.println("Warning: Microphone not initialized - voice activation disabled");
+  }
   
   // Initial battery reading
   // Battery voltage divider
@@ -589,6 +1215,12 @@ void loop_app() {
 
   // Handle button presses
   handleButton();
+  
+  // Handle touch sensor for accessibility
+  handleTouchSensor();
+  
+  // Process audio for voice activation
+  processAudio();
   
   // Update LED
   updateLED();
@@ -638,6 +1270,9 @@ void loop_app() {
   if (photoDataUploading && fb) {
     size_t remaining = fb->len - sent_photo_bytes;
     if (remaining > 0) {
+      // Check if we're in touch recording mode to prioritize audio processing
+      bool isTouchRecording = (touchState == TOUCH_RECORDING_ACTIVE || touchState == TOUCH_RECORDING_SILENCE);
+      
       // Prepare chunk
       s_compressed_frame_2[0] = (uint8_t)(sent_photo_frames & 0xFF);
       s_compressed_frame_2[1] = (uint8_t)((sent_photo_frames >> 8) & 0xFF);
@@ -650,13 +1285,16 @@ void loop_app() {
       sent_photo_bytes += bytes_to_copy;
       sent_photo_frames++;
 
-      Serial.print("Uploading chunk ");
-      Serial.print(sent_photo_frames);
-      Serial.print(" (");
-      Serial.print(bytes_to_copy);
-      Serial.print(" bytes), ");
-      Serial.print(remaining - bytes_to_copy);
-      Serial.println(" bytes remaining.");
+      // Only print detailed progress occasionally during touch recording to avoid blocking audio
+      if (!isTouchRecording || (sent_photo_frames % 10 == 0)) {
+        Serial.print("Uploading chunk ");
+        Serial.print(sent_photo_frames);
+        Serial.print(" (");
+        Serial.print(bytes_to_copy);
+        Serial.print(" bytes), ");
+        Serial.print(remaining - bytes_to_copy);
+        Serial.println(" bytes remaining.");
+      }
       
       lastActivity = now; // Register activity
     }
@@ -682,11 +1320,204 @@ void loop_app() {
   }
   
   // Adaptive delays for power saving (gentle optimization)
-  if (photoDataUploading) {
-    delay(20);  // Fast during upload
+  // CRITICAL: During touch recording, minimize delays to maintain continuous audio processing
+  bool isTouchRecording = (touchState == TOUCH_RECORDING_ACTIVE || touchState == TOUCH_RECORDING_SILENCE);
+  
+  if (photoDataUploading && isTouchRecording) {
+    // Touch recording should be complete before photo upload now
+    delay(20);  // Normal upload speed - no audio interference
+  } else if (photoDataUploading) {
+    delay(20);  // Normal upload speed when not recording audio
   } else if (powerSaveMode) {
     delay(50);  // Reduced delay with light sleep
   } else {
     delay(50);  // Reduced delay with light sleep
+  }
+}
+
+// =============================================================================
+// TOUCH SENSOR IMPLEMENTATION - Accessible alternative to voice activation
+// =============================================================================
+
+void initializeTouchSensor() {
+  // Initialize touch sensor on GPIO3
+  touchAttachInterrupt(TOUCH_SENSOR_PIN, NULL, TOUCH_THRESHOLD);
+  touchState = TOUCH_IDLE;
+  touchActivationMode = true;  // Always enabled for hardware-only operation
+  Serial.printf("Touch sensor initialized on GPIO%d with threshold %d\n", TOUCH_SENSOR_PIN, TOUCH_THRESHOLD);
+}
+
+bool isTouchDetected() {
+  // Read touch value (lower values mean touch detected)
+  uint16_t touchValue = touchRead(TOUCH_SENSOR_PIN);
+  
+  // Debug touch values occasionally
+  static unsigned long lastTouchDebug = 0;
+  if (millis() - lastTouchDebug > 3000) {  // Every 3 seconds
+    Serial.printf("👆 Touch value: %d (threshold: %d) %s\n", 
+                  touchValue, TOUCH_THRESHOLD, 
+                  touchValue < TOUCH_THRESHOLD ? "TOUCHED" : "not touched");
+    lastTouchDebug = millis();
+  }
+  
+  return touchValue < TOUCH_THRESHOLD;
+}
+
+void handleTouchSensor() {
+  unsigned long now = millis();
+  
+  switch (touchState) {
+    case TOUCH_IDLE:
+      if (isTouchDetected()) {
+        // Debounce touch detection
+        if (now - lastTouchTime > TOUCH_DEBOUNCE_MS) {
+          touchState = TOUCH_DETECTED;
+          lastTouchTime = now;
+          Serial.println("🔥 TOUCH DETECTED! Ready to record...");
+          Serial.println("💡 Get ready to speak - recording will start when you release your finger!");
+          
+          // Flash LED to indicate touch detected
+          ledMode = LED_PHOTO_CAPTURE;
+          blinkLED(2, 200);
+        }
+      }
+      break;
+      
+    case TOUCH_DETECTED:
+      if (!isTouchDetected()) {
+        // Touch released, start recording immediately
+        touchState = TOUCH_RECORDING_ACTIVE;
+        touchRecordingStartTime = now;
+        lastSpeechTime = now;
+        silenceStartTime = 0;
+        Serial.println("📝 Touch released! Recording until 2s silence...");
+        
+        // Start recording audio for backend - independent of voice system
+        if (!recordingCommand) {
+          recordingCommand = true;
+          audioBufferIndex = 0;
+          touchAudioAccumIndex = 0; // reset accumulation buffer
+          
+          // Disable voice wake word listening during touch recording
+          bool wasListening = listeningForWakeWord;
+          listeningForWakeWord = false;
+          
+          Serial.println("🎤 Starting touch-activated recording (speak now!)");
+          Serial.printf("🔧 Voice listening disabled: %s -> %s\n", 
+                       wasListening ? "YES" : "NO", "NO");
+        }
+        
+        // NOTE: Photo will be taken AFTER audio recording completes to avoid BLE interference
+        Serial.println("📸 Photo will be captured after audio recording completes...");
+        
+        // Set LED to indicate recording
+        ledMode = LED_NORMAL_OPERATION;
+      }
+      break;
+      
+    case TOUCH_RECORDING_ACTIVE:
+      // Check for speech activity
+      if (currentAudioLevel > SILENCE_THRESHOLD) {
+        // Speech detected - reset silence timer
+        lastSpeechTime = now;
+        silenceStartTime = 0;
+        Serial.printf("🎤 SPEECH: Level=%.1f%% (thresh=%.1f%%) - Recording continues\n", currentAudioLevel, SILENCE_THRESHOLD);
+      } else {
+        // Silence detected
+        if (silenceStartTime == 0) {
+          // Start counting silence
+          silenceStartTime = now;
+          touchState = TOUCH_RECORDING_SILENCE;
+          Serial.printf("🤫 SILENCE START: Level=%.1f%% (thresh=%.1f%%) - %ds timer started\n", currentAudioLevel, SILENCE_THRESHOLD, TOUCH_SILENCE_DURATION_MS/1000);
+        }
+      }
+      
+      // Safety timeout (max 30 seconds)
+      if (now - touchRecordingStartTime >= TOUCH_ACTIVATION_TIMEOUT) {
+        Serial.println("⏰ Maximum recording time reached! Processing...");
+        touchState = TOUCH_PROCESSING;
+      }
+      break;
+      
+    case TOUCH_RECORDING_SILENCE:
+      // Check if speech resumed
+      if (currentAudioLevel > SILENCE_THRESHOLD) {
+        // Speech resumed - go back to active recording
+        touchState = TOUCH_RECORDING_ACTIVE;
+        lastSpeechTime = now;
+        silenceStartTime = 0;
+        Serial.printf("🎤 Speech resumed (%.1f%%) - back to recording\n", currentAudioLevel);
+      } else {
+        // Continue counting silence
+        unsigned long silenceDuration = now - silenceStartTime;
+        Serial.printf("🤫 SILENCE: %.1fs / %ds (Level=%.1f%%, thresh=%.1f%%)\n", 
+                     silenceDuration/1000.0f, TOUCH_SILENCE_DURATION_MS/1000, currentAudioLevel, SILENCE_THRESHOLD);
+        
+        if (silenceDuration >= TOUCH_SILENCE_DURATION_MS) {
+          // 4 seconds of silence - stop recording
+          unsigned long totalRecordingTime = now - touchRecordingStartTime;
+          
+          if (totalRecordingTime >= TOUCH_MIN_RECORDING_MS) {
+            Serial.printf("✅ Recording complete! Duration: %lums (%ds silence detected)\n", totalRecordingTime, TOUCH_SILENCE_DURATION_MS/1000);
+            touchState = TOUCH_PROCESSING;
+          } else {
+            Serial.printf("⚠️ Recording too short (%lums) - continuing...\n", totalRecordingTime);
+            touchState = TOUCH_RECORDING_ACTIVE;
+            silenceStartTime = 0;
+          }
+        }
+      }
+      
+      // Safety timeout
+      if (now - touchRecordingStartTime >= TOUCH_ACTIVATION_TIMEOUT) {
+        Serial.println("⏰ Maximum recording time reached during silence! Processing...");
+        touchState = TOUCH_PROCESSING;
+      }
+      break;
+      
+    case TOUCH_PROCESSING:
+      // Stop recording and send data
+      if (recordingCommand) {
+        recordingCommand = false; // Stop recording immediately
+        Serial.printf("📤 Sending final touch audio data: %u bytes accumulated\n", (unsigned)touchAudioAccumIndex);
+        if (touchAudioAccumIndex > 0) {
+          sendAudioData(touchAudioAccum, touchAudioAccumIndex);
+          Serial.printf("✅ Touch-activated FULL SESSION sent: %u bytes (%.1fs audio)\n", (unsigned)touchAudioAccumIndex, (float)touchAudioAccumIndex / (16000.0f * 2.0f));
+        } else if (audioBufferIndex > 0) {
+          // Fallback if accumulation somehow empty
+          sendAudioData(bleAudioBuffer, audioBufferIndex);
+          Serial.println("✅ Touch-activated voice recording sent (fallback small buffer)");
+        } else {
+          Serial.println("⚠️ No audio data captured during touch recording!");
+        }
+        audioBufferIndex = 0;
+        touchAudioAccumIndex = 0;
+        
+        // Keep wake word disabled - we only use touch activation
+        listeningForWakeWord = false;
+        Serial.println("🎤 Touch recording complete - ready for next touch activation");
+        
+        // NOW take photo after audio is complete (no BLE interference!)
+        Serial.println("📸 Now taking photo after audio recording completed...");
+        if (!isCapturingPhotos) {
+          isCapturingPhotos = true;
+          captureInterval = 0;  // Single shot
+        }
+      }
+      
+      // Check if photo capture is complete before resetting to idle
+      if (!isCapturingPhotos) {
+        // Flash LED to indicate processing complete
+        ledMode = LED_PHOTO_CAPTURE;
+        blinkLED(3, 100);
+        
+        // Reset to idle state
+        touchState = TOUCH_IDLE;
+        touchActivationMode = false;
+        ledMode = LED_NORMAL_OPERATION;
+        
+        Serial.println("🔄 Touch activation complete. Ready for next touch.");
+      }
+      break;
   }
 }

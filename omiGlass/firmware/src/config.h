@@ -4,9 +4,15 @@
 // =============================================================================
 // BOARD CONFIGURATION - Must be defined before camera includes
 // =============================================================================
+#ifndef CAMERA_MODEL_XIAO_ESP32S3
 #define CAMERA_MODEL_XIAO_ESP32S3  // Define camera model for Seeed Xiao ESP32S3
+#endif
+#ifndef BOARD_HAS_PSRAM
 #define BOARD_HAS_PSRAM            // Enable PSRAM support
+#endif
+#ifndef CONFIG_ARDUHAL_ESP_LOG
 #define CONFIG_ARDUHAL_ESP_LOG     // Enable Arduino HAL logging
+#endif
 
 // =============================================================================
 // DEVICE CONFIGURATION
@@ -96,6 +102,28 @@ typedef enum {
 } power_state_t;
 
 // =============================================================================
+// MICROPHONE CONFIGURATION - I2S PDM for XIAO ESP32S3 Sense
+// =============================================================================
+#define MICROPHONE_ENABLED true                // Enable microphone functionality
+#define MICROPHONE_I2S_PORT I2S_NUM_0          // MUST use I2S0 - PDM only works on I2S0 in ESP32-S3
+#define MICROPHONE_WS_PIN 42                   // GPIO42 - PDM Clock pin (CLK) 
+#define MICROPHONE_SD_PIN 41                   // GPIO41 - PDM Data pin (DIN)
+#define MICROPHONE_SAMPLE_RATE 16000           // 16kHz sample rate
+#define MICROPHONE_BITS_PER_SAMPLE 16          // 16-bit samples
+#define MICROPHONE_BUFFER_SIZE 1024            // Buffer size for audio samples
+
+// Audio Processing
+#define AUDIO_LEVEL_SMOOTH_FACTOR 0.1f         // Smoothing factor for audio level calculation
+#define AUDIO_CHUNK_SIZE 512                   // Size of audio chunks for BLE transmission
+#define AUDIO_TASK_INTERVAL_MS 50              // 50ms audio processing interval (20 FPS)
+#define AUDIO_TASK_STACK_SIZE 4096             // Audio task stack size
+#define AUDIO_TASK_PRIORITY 3                  // High priority for audio processing
+
+// Audio Level Detection
+#define AUDIO_SILENCE_THRESHOLD 500            // Threshold for silence detection
+#define AUDIO_LEVEL_HISTORY_SIZE 10            // Number of samples for level averaging
+
+// =============================================================================
 // TASK CONFIGURATION - Optimized stack sizes
 // =============================================================================
 #define BATTERY_TASK_STACK_SIZE 2048
@@ -153,6 +181,17 @@ typedef enum {
 #define POWER_OFF_PRESS_MS 2000           // Long press duration for power off (2 seconds)
 #define BOOT_COMPLETE_DELAY_MS 3000       // LED indication during boot
 
+// =============================================================================
+// TOUCH SENSOR CONFIGURATION
+// =============================================================================
+#define TOUCH_SENSOR_PIN 3                // GPIO3 - Touch sensor for activation
+#define TOUCH_THRESHOLD 18000             // Touch sensitivity threshold (lower values = touch detected)
+#define TOUCH_DEBOUNCE_MS 50              // Touch debounce time - reduced for better responsiveness
+#define TOUCH_SILENCE_DURATION_MS 1000     // 1 second of silence to stop recording
+#define TOUCH_ACTIVATION_TIMEOUT 30000    // 30 seconds max recording timeout
+#define TOUCH_MIN_RECORDING_MS 500        // Minimum recording duration (0.5 seconds)
+#define SILENCE_THRESHOLD 8.0             // Audio level percentage threshold for silence detection (8% = real silence)
+
 // LED Status Patterns (in milliseconds)
 #define LED_BOOT_BLINK_FAST 200           // Fast blink during boot
 #define LED_BATTERY_LOW_BLINK 1000        // Slow blink for low battery
@@ -170,6 +209,15 @@ typedef enum {
     BUTTON_LONG_PRESS,
     BUTTON_RELEASED
 } button_state_t;
+
+// Touch Sensor States
+typedef enum {
+    TOUCH_IDLE,
+    TOUCH_DETECTED,
+    TOUCH_RECORDING_ACTIVE,     // Recording while detecting speech
+    TOUCH_RECORDING_SILENCE,    // Counting silence duration
+    TOUCH_PROCESSING
+} touch_state_t;
 
 // LED Status Modes
 typedef enum {

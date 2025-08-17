@@ -7,6 +7,7 @@ import { DeviceView } from './DeviceView';
 import { startAudio } from '../modules/groq';
 import { debugOpenGlassDevice, analyzeNearbyDevices } from '../modules/bluetoothDebug';
 import { testGroqIntegration } from '../utils/testGroq';
+import { testGroqStt } from '../utils/testGroqStt';
 
 export const Main = React.memo(() => {
 
@@ -88,6 +89,12 @@ export const Main = React.memo(() => {
                                     <RoundButton 
                                         title="🧪 Test Groq TTS" 
                                         action={() => testGroqIntegration()} 
+                                    />
+                                </View>
+                                <View style={{ marginTop: 10 }}>
+                                    <RoundButton 
+                                        title="🧪 Test Groq STT" 
+                                        action={() => testGroqStt()} 
                                     />
                                 </View>
                             </View>

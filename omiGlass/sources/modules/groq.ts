@@ -12,9 +12,10 @@ export async function startAudio() {
     audioContext = new AudioContext();
 }
 
+// Desktop TTS enabled for local audio playback
 export async function textToSpeech(text: string) {
     try {
-        console.log('🔊 Using Groq TTS for:', text);
+        console.log('🔊 Using Groq TTS for desktop playback:', text);
         
         // Initialize AudioContext if not already done
         if (!audioContext) {
@@ -22,8 +23,10 @@ export async function textToSpeech(text: string) {
         }
         
         const response = await axios.post("https://api.groq.com/openai/v1/audio/speech", {
-            model: "playai-tts-arabic",
-            voice: "Ahmad-PlayAI",
+            model: "playai-tts",
+            // model: "playai-tts-arabic",
+            voice: "Aaliyah-PlayAI",
+            // voice: "Ahmad-PlayAI",
             response_format: "wav",
             input: text,
         }, {
@@ -40,7 +43,7 @@ export async function textToSpeech(text: string) {
         source.connect(audioContext.destination);
         source.start();  // Play the audio immediately
 
-        console.log('✅ Groq TTS playback started');
+        console.log('✅ Groq TTS playback started on desktop speakers');
         return response.data;
     } catch (error) {
         console.error("Error in Groq textToSpeech:", error);
@@ -90,4 +93,42 @@ export async function groqChatCompletion(systemPrompt: string, userPrompt: strin
         console.error("Error in Groq chat completion:", error);
         return null;
     }
+}
+
+export function pcm16ToWavBlob(pcmData: Int16Array, sampleRate: number): Blob {
+    const numChannels = 1;
+    const bytesPerSample = 2;
+    const blockAlign = numChannels * bytesPerSample;
+    const byteRate = sampleRate * blockAlign;
+    const dataSize = pcmData.length * bytesPerSample;
+    const buffer = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(buffer);
+
+    let offset = 0;
+    const writeString = (s: string) => { for (let i = 0; i < s.length; i++) view.setUint8(offset + i, s.charCodeAt(i)); offset += s.length; };
+
+    writeString('RIFF');
+    view.setUint32(offset, 36 + dataSize, true); offset += 4;
+    writeString('WAVE');
+    writeString('fmt ');
+    view.setUint32(offset, 16, true); offset += 4;          // Subchunk1Size (16 for PCM)
+    view.setUint16(offset, 1, true); offset += 2;           // AudioFormat (1=PCM)
+    view.setUint16(offset, numChannels, true); offset += 2; // NumChannels
+    view.setUint32(offset, sampleRate, true); offset += 4;  // SampleRate
+    view.setUint32(offset, byteRate, true); offset += 4;    // ByteRate
+    view.setUint16(offset, blockAlign, true); offset += 2;  // BlockAlign
+    view.setUint16(offset, bytesPerSample * 8, true); offset += 2; // BitsPerSample
+    writeString('data');
+    view.setUint32(offset, dataSize, true); offset += 4;    // Subchunk2Size
+
+    // PCM samples
+    const out = new Int16Array(buffer, 44);
+    out.set(pcmData);
+
+    return new Blob([buffer], { type: 'audio/wav' });
+}
+
+export async function transcribePcm16(pcmData: Int16Array, sampleRate: number = 16000) {
+    const wavBlob = pcm16ToWavBlob(pcmData, sampleRate);
+    return transcribeAudio(wavBlob);
 }

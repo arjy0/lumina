@@ -1,0 +1,13 @@
+{
+  "name": "omiglass-firmware",
+  "version": "1.0.0",
+  "description": "OpenGlass firmware for XIAO ESP32S3",
+  "main": "src/main.cpp",
+  "scripts": {
+    "build": "pio run",
+    "upload": "pio run --target upload"
+  },
+  "keywords": ["esp32", "camera", "bluetooth", "ble"],
+  "author": "OmiGlass",
+  "license": "MIT"
+}

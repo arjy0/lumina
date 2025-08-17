@@ -5,6 +5,7 @@ import { toBase64Image } from '../utils/base64';
 import { Agent } from '../agent/Agent';
 import { InvalidateSync } from '../utils/invalidateSync';
 import { textToSpeech } from '../modules/groq';
+import { transcribePcm16 } from '../modules/groq';
 
 // JPEG Analysis function
 function analyzeJPEGStructure(data: Uint8Array) {
@@ -157,6 +158,47 @@ function usePhotos(device: BluetoothRemoteGATTServer) {
                 }
             };
             
+            // Auto-complete transmission if no data received for 2 seconds
+            const setTransmissionTimeout = () => {
+                clearTransmissionTimeout();
+                transmissionTimeout = setTimeout(() => {
+                    console.log('⏰ Transmission timeout - auto-completing image');
+                    console.log('📸 Auto-completing with', buffer.length, 'bytes received');
+                    console.log('🔍 TIMEOUT ANALYSIS:');
+                    console.log('   - Expected: Complete JPEG starting with FF D8');
+                    console.log('   - Received:', buffer.length, 'bytes');
+                    console.log('   - First bytes:', buffer.length > 0 ? Array.from(buffer.slice(0, 8)).map(b => b.toString(16).padStart(2, '0')).join(' ') : 'none');
+                    console.log('   - Last bytes:', buffer.length > 8 ? Array.from(buffer.slice(-8)).map(b => b.toString(16).padStart(2, '0')).join(' ') : 'none');
+                    
+                    if (buffer.length > 500) { // Only process if we have substantial data
+                        console.log('✅ Sufficient data for AI processing');
+                        
+                        // CRITICAL: Check if we have JPEG header
+                        const hasJPEGHeader = buffer.length >= 2 && buffer[0] === 0xFF && buffer[1] === 0xD8;
+                        
+                        if (!hasJPEGHeader && buffer.length > 0) {
+                            console.warn('⚠️ CRITICAL: Missing JPEG header (FF D8)!');
+                            console.warn('⚠️ This suggests transmission started mid-stream');
+                            console.warn('⚠️ Device likely disconnected during a previous transmission');
+                            console.warn('💡 SOLUTION: Use "Reset Device Transmission" button');
+                            console.warn('💡 Then click "Activate OpenGlass" for fresh capture');
+                            
+                            // Skip this incomplete transmission and wait for next complete one
+                            console.log('🔄 Skipping incomplete transmission, waiting for next complete image...');
+                            console.log('🔄 TIP: Use the Reset button if this keeps happening');
+                            buffer = new Uint8Array(0);
+                            previousChunk = -1;
+                            return;
+                        }
+                        
+                        onChunk(null, new Uint8Array()); // Force end processing
+                    } else {
+                        console.log('⚠️ Insufficient data, waiting for more...');
+                        previousChunk = -1; // Reset for next transmission
+                    }
+                }, 2000); // 2 second timeout
+            };
+            
 
             function onChunk(id: number | null, data: Uint8Array) {
                 // Resolve if packet is the first one
@@ -176,6 +218,9 @@ function usePhotos(device: BluetoothRemoteGATTServer) {
                             console.log('🏁 End marker received - processing photo');
                             console.log('📸 Photo size:', buffer.length, 'bytes');
                             console.log('🔢 Photos array length before processing:', photos.length);
+                            
+                            // Clear timeout since we got proper end marker
+                            clearTransmissionTimeout();
                             
                             // TRANSMISSION ANALYSIS - Check if we're getting incomplete data
                             console.log('🔍 TRANSMISSION ANALYSIS:');
@@ -458,22 +503,25 @@ function usePhotos(device: BluetoothRemoteGATTServer) {
                 // Append data
                 buffer = new Uint8Array([...buffer, ...data]);
                 console.log('📦 Packet', id, '- Buffer size:', buffer.length, 'bytes');
+                
+                // Set/reset timeout for each packet received
+                setTransmissionTimeout();
             }
 
             try {
-                console.log('DeviceView: Trying to get omiGlass service...');
+                console.log(': Trying to get omiGlass service...');
                 // Subscribe for photo updates
                 const service = await device.getPrimaryService('19B10000-E8F2-537E-4F6C-D104768A1214'.toLowerCase());
-                console.log('DeviceView: Got service successfully');
+                console.log(': Got service successfully');
                 
-                console.log('DeviceView: Getting photo data characteristic...');
+                console.log(': Getting photo data characteristic...');
                 const photoCharacteristic = await service.getCharacteristic('19b10005-e8f2-537e-4f6c-d104768a1214');
-                console.log('DeviceView: Got photo data characteristic:', photoCharacteristic);
+                console.log(': Got photo data characteristic:', photoCharacteristic);
                 
-                console.log('DeviceView: Starting notifications...');
+                console.log(': Starting notifications...');
                 await photoCharacteristic.startNotifications();
-                console.log('DeviceView: Notifications started successfully');
-                console.log('DeviceView: Checking notification properties:', {
+                console.log(': Notifications started successfully');
+                console.log(': Checking notification properties:', {
                     canNotify: photoCharacteristic.properties.notify,
                     canIndicate: photoCharacteristic.properties.indicate,
                     canRead: photoCharacteristic.properties.read
@@ -514,18 +562,113 @@ function usePhotos(device: BluetoothRemoteGATTServer) {
                     }
                 });
                 
-                console.log('DeviceView: Getting photo control characteristic...');
+                console.log(': Getting photo control characteristic...');
                 const photoControlCharacteristic = await service.getCharacteristic('19b10006-e8f2-537e-4f6c-d104768a1214');
-                console.log('DeviceView: Got photo control characteristic:', photoControlCharacteristic);
+                console.log(': Got photo control characteristic:', photoControlCharacteristic);
+
+                // Add audio data characteristic setup for touch-activated recordings
+                console.log('🎵 Getting audio data characteristic...');
+                try {
+                    const audioCharacteristic = await service.getCharacteristic('19b10001-e8f2-537e-4f6c-d104768a1214');
+                    console.log('✅ Got audio data characteristic:', audioCharacteristic);
+                    console.log('🎵 Audio characteristic properties:', {
+                        notify: audioCharacteristic.properties.notify,
+                        read: audioCharacteristic.properties.read,
+                        write: audioCharacteristic.properties.write
+                    });
+                    
+                    if (!audioCharacteristic.properties.notify) {
+                        console.error('❌ Audio characteristic does not support notifications!');
+                    } else {
+                        await audioCharacteristic.startNotifications();
+                        console.log('✅ Audio notifications started successfully');
+                        console.log('🎵 Audio characteristic UUID:', audioCharacteristic.uuid);
+                        console.log('🎵 Waiting for audio data from touch activations...');
+                        
+                        // Improved accumulation strategy with inactivity timeout
+                        let audioAssemble: Uint8Array[] = [];
+                        let packetCount = 0;
+                        let inactivityTimer: any = null;
+                        let audioStreamEnded = false;
+                        const INACTIVITY_MS = 2000; // Longer timeout for batch mode transmission
+                        // Reduced threshold; firmware currently sends small bursts (~2KB)
+                        // 2000 payload bytes ≈ 1000 samples ≈ 62.5ms @16kHz (still short but we will try)
+                        const MIN_TRANSCRIBE_BYTES = 10000; // Expecting much larger batches now
+                        const MAX_ACCUM_BYTES = 200000; // Updated cap for batch mode (~6s audio)
+                        const resetInactivity = () => {
+                            if (inactivityTimer) clearTimeout(inactivityTimer);
+                            inactivityTimer = setTimeout(() => {
+                                if (audioStreamEnded) return; // already dispatched
+                                const total = audioAssemble.reduce((s, c) => s + c.length, 0);
+                                console.log(`🎵 Inactivity timeout. Raw (with headers)=${total} bytes`);
+                                if (total >= MIN_TRANSCRIBE_BYTES) {
+                                    console.log('🎵 Dispatching (inactivity) touchAudioReceived');
+                                    window.dispatchEvent(new CustomEvent('touchAudioReceived', { detail: { audioBuffer: [...audioAssemble] } }));
+                                } else {
+                                    console.warn(`⚠️ Short audio (${total} < ${MIN_TRANSCRIBE_BYTES}) sending anyway for STT (may fallback)`);
+                                    window.dispatchEvent(new CustomEvent('touchAudioReceived', { detail: { audioBuffer: [...audioAssemble] } }));
+                                }
+                                audioStreamEnded = true;
+                            }, INACTIVITY_MS);
+                        };
+                         
+                         audioCharacteristic.addEventListener('characteristicvaluechanged', (e) => {
+                             const value = (e.target as BluetoothRemoteGATTCharacteristic).value!;
+                             const dataArray = new Uint8Array(value.buffer);
+                             packetCount++;
+                             console.log(`🎵 AUDIO PKT ${packetCount}: ${dataArray.length} bytes`);
+                            if (audioStreamEnded) return; // ignore stray packets after end
+                            // Detect JPEG header accidentally coming over audio characteristic (start of photo)
+                            if (dataArray.length >= 4 && dataArray[2] === 0xFF && dataArray[3] === 0xD8) {
+                                console.log('📸 JPEG header detected in audio stream -> treat as end of audio, do not include JPEG bytes');
+                                // Dispatch whatever audio we have
+                                const total = audioAssemble.reduce((s,c)=>s+c.length,0);
+                                if (total === 0) {
+                                    console.warn('⚠️ No audio accumulated before JPEG start; ignoring');
+                                } else {
+                                    window.dispatchEvent(new CustomEvent('touchAudioReceived', { detail: { audioBuffer: [...audioAssemble] } }));
+                                }
+                                audioStreamEnded = true;
+                                return;
+                            }
+                            audioAssemble.push(dataArray);
+                             const totalNoHeaders = audioAssemble.reduce((s, c) => s + Math.max(0, c.length - 2), 0);
+                             const estMs = (totalNoHeaders / 2) / 16; // samples/16 = ms at 16kHz
+                             if (packetCount % 5 === 0) {
+                                 console.log(`🎵 Accumulating: packets=${packetCount}, payloadBytes≈${totalNoHeaders}, estDuration≈${estMs.toFixed(0)}ms`);
+                             }
+                            if (totalNoHeaders >= MAX_ACCUM_BYTES) {
+                                console.log('🎵 Reached MAX_ACCUM_BYTES cap, dispatching early');
+                                window.dispatchEvent(new CustomEvent('touchAudioReceived', { detail: { audioBuffer: [...audioAssemble] } }));
+                                audioStreamEnded = true;
+                                return;
+                            }
+                             resetInactivity();
+                         });
+                     }
+                 } catch (err) {
+                     console.error('❌ Audio characteristic setup failed:', err);
+                 }
+
+                console.log(': Setup complete - device connected but in standby mode');
+                console.log('🎤 IMPORTANT: Photos will ONLY be captured when voice commands are given');
+                console.log('🎤 Proper workflow: Say "Lumina" → Ask question → Photo captured → AI processing');
+                console.log('📱 No automatic photo capture - device waiting for voice activation');
                 
-                console.log('DeviceView: Writing to photo control characteristic...');
-                await photoControlCharacteristic.writeValue(new Uint8Array([0x05]));
-                console.log('DeviceView: Write operation successful');
+                // Send STOP command immediately to prevent any auto-capture
+                console.log('🛑 Sending initial STOP command to ensure device is in standby...');
+                try {
+                    const stopCommand = new Int8Array([0]); // 0 = stop any ongoing capture
+                    await photoControlCharacteristic.writeValue(stopCommand);
+                    console.log('✅ Device confirmed in standby mode - waiting for voice commands only');
+                } catch (stopError) {
+                    console.warn('⚠️ Could not send stop command, but continuing...');
+                }
                 
-                console.log('DeviceView: Setup complete');
+                console.log(': Setup complete');
             } catch (error) {
-                console.error('DeviceView: Failed to setup omiGlass service:', error);
-                console.error('DeviceView: This device does not support omiGlass service');
+                console.error(': Failed to setup omiGlass service:', error);
+                console.error(': This device does not support omiGlass service');
             }
         })();
     }, []);
@@ -540,7 +683,239 @@ export const DeviceView = React.memo((props: { device: BluetoothRemoteGATTServer
     const [activePhotoIndex, setActivePhotoIndex] = React.useState<number | null>(null);
     const [isWaitingForResponse, setIsWaitingForResponse] = React.useState(false);
     const [lastQuestion, setLastQuestion] = React.useState<string>("");
-    const [audioOutputMode, setAudioOutputMode] = React.useState<'mobile' | 'desktop'>('mobile');
+
+    // Voice activation states
+    const [isListening, setIsListening] = React.useState(false);
+    const [isWaitingForCommand, setIsWaitingForCommand] = React.useState(false);
+    const [voiceCommand, setVoiceCommand] = React.useState<string>("");
+    const [recognition, setRecognition] = React.useState<any>(null);
+
+    // Touch activation states
+    const [touchActivationMode, setTouchActivationMode] = React.useState(false);
+    const [isTouchWaiting, setIsTouchWaiting] = React.useState(false);
+    const [touchStatusMessage, setTouchStatusMessage] = React.useState("");
+
+    // Auto-enable touch mode when device is connected (better UX for hardware touch sensor)
+    React.useEffect(() => {
+        if (subscribed && !touchActivationMode) {
+            console.log('👆 Auto-enabling touch activation mode for hardware touch sensor support');
+            setTouchActivationMode(true);
+            setTouchStatusMessage("Touch device to record until 1.5s silence");
+        }
+    }, [subscribed, touchActivationMode]);
+
+    // Listen for touch audio data events
+    React.useEffect(() => {
+        const handleTouchAudio = (event: CustomEvent) => {
+            const { audioBuffer } = event.detail;
+            console.log('🎵 Received touch audio event, processing...');
+            processReceivedAudio(audioBuffer);
+        };
+
+        window.addEventListener('touchAudioReceived', handleTouchAudio as EventListener);
+        
+        return () => {
+            window.removeEventListener('touchAudioReceived', handleTouchAudio as EventListener);
+        };
+    }, []);
+
+    // Initialize speech recognition
+    React.useEffect(() => {
+        if (typeof window !== 'undefined' && ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window)) {
+            const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+            const recognitionInstance = new SpeechRecognition();
+            recognitionInstance.continuous = true;
+            recognitionInstance.interimResults = false;
+            recognitionInstance.lang = 'en-US';
+            
+            recognitionInstance.onresult = (event: any) => {
+                const transcript = event.results[event.results.length - 1][0].transcript.toLowerCase().trim();
+                console.log('🎤 Voice detected:', transcript);
+                
+                // Handle touch activation mode
+                if (touchActivationMode && isTouchWaiting) {
+                    console.log('👆 Touch mode: Processing voice command:', transcript);
+                    setVoiceCommand(transcript);
+                    setIsTouchWaiting(false);
+                    setTouchStatusMessage("Processing command...");
+                    setIsListening(false);
+                    recognitionInstance.stop();
+                    
+                    // Process the command and trigger photo capture
+                    processVoiceCommand(transcript);
+                    return;
+                }
+                
+                // Handle regular voice activation mode
+                if (!isWaitingForCommand) {
+                    // Check for wake word
+                    if (transcript.includes('lumina')) {
+                        console.log('🎯 Wake word detected! Activating voice command mode...');
+                        setIsWaitingForCommand(true);
+                        setVoiceCommand("");
+                        console.log('🎤 Wake word detected! Say your command now...');
+                    }
+                } else {
+                    // Process voice command
+                    console.log('📝 Processing voice command:', transcript);
+                    setVoiceCommand(transcript);
+                    setIsWaitingForCommand(false);
+                    
+                    // Trigger photo capture and processing with voice command
+                    processVoiceCommand(transcript);
+                }
+            };
+            
+            recognitionInstance.onerror = (event: any) => {
+                console.error('🚨 Speech recognition error:', event.error);
+                if (event.error === 'not-allowed') {
+                    console.error('❌ Microphone access denied. Please allow microphone access to use voice commands.');
+                }
+            };
+            
+            recognitionInstance.onend = () => {
+                if (isListening) {
+                    // Restart recognition if we're still supposed to be listening
+                    recognitionInstance.start();
+                }
+            };
+            
+            setRecognition(recognitionInstance);
+        } else {
+            console.warn('⚠️ Speech recognition not supported in this browser');
+        }
+    }, [isListening]);
+
+    // Start/stop listening
+    const toggleVoiceActivation = React.useCallback(() => {
+        if (!recognition) return;
+        
+        if (isListening) {
+            recognition.stop();
+            setIsListening(false);
+            setIsWaitingForCommand(false);
+            console.log('🛑 Voice activation stopped');
+        } else {
+            recognition.start();
+            setIsListening(true);
+            console.log('🎤 Voice activation started - say "lumina" to activate');
+        }
+    }, [recognition, isListening]);
+
+    // Toggle touch activation mode
+    const toggleTouchActivation = React.useCallback(() => {
+        if (touchActivationMode) {
+            setTouchActivationMode(false);
+            setIsTouchWaiting(false);
+            setTouchStatusMessage("");
+            console.log('🛑 Touch activation disabled');
+        } else {
+            setTouchActivationMode(true);
+            setTouchStatusMessage("Touch device to record until 1.5s silence");
+            console.log('👆 Touch activation enabled - records until 1.5s silence + photo');
+        }
+    }, [touchActivationMode]);
+
+    // Simulate touch activation (since we can't actually detect hardware touch from web)
+    const simulateTouchActivation = React.useCallback(() => {
+        if (!touchActivationMode) return;
+        
+        setIsTouchWaiting(true);
+        setTouchStatusMessage("Touch detected! Speak now, will stop after 1.5s silence...");
+        console.log('👆 Touch detected! Speak now - recording until 1.5s silence...');
+        
+        // Start voice recognition for the command (will detect speech/silence automatically)
+        if (recognition && !isListening) {
+            recognition.start();
+            setIsListening(true);
+        }
+        
+        // Simulate automatic silence detection (in real hardware this would be done by ESP32)
+        // For web demo, we'll stop after a reasonable time or when user stops speaking
+        let silenceTimer: NodeJS.Timeout;
+        let lastSpeechTime = Date.now();
+        
+        const checkForSilence = () => {
+            const timeSinceLastSpeech = Date.now() - lastSpeechTime;
+            if (timeSinceLastSpeech >= 1500) { // 1.5 seconds of silence
+                if (recognition && isListening) {
+                    recognition.stop();
+                    setIsListening(false);
+                }
+                
+                setIsTouchWaiting(false);
+                setTouchStatusMessage("Recording complete! Processing command and photo...");
+                console.log('🤫 1.5s silence detected! Processing command and taking photo...');
+                
+                // Trigger photo capture automatically after recording
+                activateOpenGlass();
+                
+                // Reset after processing
+                setTimeout(() => {
+                    setTouchStatusMessage("Ready for next touch activation");
+                }, 3000);
+            } else {
+                silenceTimer = setTimeout(checkForSilence, 100); // Check every 100ms
+            }
+        };
+        
+        // Start monitoring for silence
+        silenceTimer = setTimeout(checkForSilence, 100);
+        
+        // Update last speech time when speech is detected (simplified for web demo)
+        const speechDetectionInterval = setInterval(() => {
+            if (isListening) {
+                lastSpeechTime = Date.now(); // In real implementation, this would be based on audio levels
+            } else {
+                clearInterval(speechDetectionInterval);
+            }
+        }, 200);
+        
+        // Maximum timeout (30 seconds safety)
+        setTimeout(() => {
+            if (isTouchWaiting) {
+                clearTimeout(silenceTimer);
+                clearInterval(speechDetectionInterval);
+                setIsTouchWaiting(false);
+                setTouchStatusMessage("Recording timeout. Touch again to activate.");
+                console.log('⏰ Touch activation timeout');
+                if (recognition && isListening) {
+                    recognition.stop();
+                    setIsListening(false);
+                }
+            }
+        }, 30000);
+    }, [touchActivationMode, recognition, isListening, isTouchWaiting]);
+
+    // Process voice command with photo capture
+    const processVoiceCommand = async (command: string) => {
+        console.log('🗣️ Processing voice command:', command);
+        console.log('🎤 VOICE WORKFLOW ACTIVATED:');
+        console.log('  1. Voice command received:', command);
+        console.log('  2. Now capturing fresh photo...');
+        console.log('  3. Will process vision + voice together');
+        
+        setLastQuestion(command);
+        setIsWaitingForResponse(true);
+        
+        console.log(`🎤 Voice command: "${command}"`);
+        console.log('📸 Triggering photo capture ONLY because voice command was given...');
+        
+        // Clear any existing photos to ensure we get fresh data
+        console.log('🧹 Clearing any old photos to ensure fresh capture...');
+        
+        // Trigger photo capture from glasses ONLY for voice commands
+        await activateOpenGlass();
+        
+        // Clear voice command after processing
+        setTimeout(() => setVoiceCommand(""), 5000);
+        
+        // Reset touch state if we were in touch mode
+        if (touchActivationMode) {
+            setTouchStatusMessage("Ready for next touch activation");
+            setIsTouchWaiting(false);
+        }
+    };
 
     // Download function for debugging images
     const downloadImage = (imageData: Uint8Array, index: number) => {
@@ -560,37 +935,60 @@ export const DeviceView = React.memo((props: { device: BluetoothRemoteGATTServer
         }
     };
 
-    // Simulate OpenGlass activation (like pressing the button on glasses)
+    // Simulate OpenGlass activation (like pressing the button on glasses) - ONLY for voice commands
     const activateOpenGlass = async () => {
-        console.log('🔴 OpenGlass activated!');
+        console.log('🔴 OpenGlass activated for voice command!');
+        console.log('📷 This photo capture was triggered by voice command workflow');
         setIsWaitingForResponse(true);
+        setLastQuestion("Capturing fresh photo for voice command...");
         
-        // Send activation command to mobile (glasses)
+        // Don't process existing photos - we need fresh capture for voice command
+        console.log('📱 Requesting fresh photo capture for voice command...');
+        setLastQuestion("Requesting fresh photo for voice analysis...");
+        
+        // Reset device transmission state and request fresh capture
         try {
             const service = await props.device.getPrimaryService('19b10000-e8f2-537e-4f6c-d104768a1214');
             const photoControlCharacteristic = await service.getCharacteristic('19b10006-e8f2-537e-4f6c-d104768a1214');
             
-            // Send activation command (0x10 = start recording + photo capture)
-            await photoControlCharacteristic.writeValue(new Uint8Array([0x10])); 
-            console.log('📱 Activation command sent to mobile (glasses)');
-            setLastQuestion("Waiting for audio from glasses...");
+            // STEP 1: Send stop command to reset any ongoing transmission
+            console.log('🛑 Sending STOP command to reset device state...');
+            const stopCommand = new Int8Array([0]); // 0 = stop capture
+            await photoControlCharacteristic.writeValue(stopCommand);
+            console.log('✅ STOP command sent');
             
-            // EXPERIMENTAL: Try to request higher quality image
-            console.log('🧪 EXPERIMENTAL: Requesting high-quality image...');
-            setTimeout(async () => {
-                try {
-                    // Try different command codes to see if device supports quality settings
-                    await photoControlCharacteristic.writeValue(new Uint8Array([0x11])); // Alternative command
-                    console.log('🧪 Alternative image quality command sent');
-                } catch (error) {
-                    console.log('🧪 Alternative command failed (expected):', error);
-                }
-            }, 100);
+            // Wait for device to process stop command
+            await new Promise(resolve => setTimeout(resolve, 500));
             
+            // STEP 2: Send single photo capture command for voice command
+            console.log('📷 Requesting fresh photo for voice command analysis...');
+            const captureCommand = new Int8Array([-1]); // -1 = single photo
+            await photoControlCharacteristic.writeValue(captureCommand);
+            console.log('✅ Fresh photo capture requested for voice command');
+            
+            setLastQuestion("Capturing photo for voice command analysis...");
         } catch (error) {
-            console.error('❌ Error sending activation command:', error);
-            setIsWaitingForResponse(false);
+            console.error('❌ Failed to send commands:', error);
+            
+            if (error instanceof Error) {
+                if (error.name === 'NotSupportedError' || error.message.includes('GATT operation failed')) {
+                    console.error('🚨 GATT operation failed - device is in unstable state');
+                    console.error('💡 SOLUTION: Physical device reset required');
+                    console.error('   1. Unplug USB cable from XIAO ESP32S3');
+                    console.error('   2. Wait 5 seconds');
+                    console.error('   3. Plug back in');
+                    console.error('   4. Wait for "OMI Glass" to reconnect');
+                    setLastQuestion("⚠️ Device reset required - see console for instructions");
+                } else {
+                    console.error('❌ Unexpected GATT error:', error.message);
+                    setLastQuestion("GATT error - check console for details");
+                }
+            }
+            
+            console.log('⏳ Waiting for automatic image transmission...');
         }
+        
+        // The device should now send a fresh, complete JPEG starting with FF D8
     };
 
     // Process when we receive audio + photo data from mobile
@@ -609,28 +1007,21 @@ export const DeviceView = React.memo((props: { device: BluetoothRemoteGATTServer
                 await agent.addPhoto([latestPhoto.data]);
                 console.log('✅ Photo added to agent successfully');
                 
-                // For now, simulate a question - in real implementation, 
-                // audio would be transcribed from mobile
-                const simulatedQuestion = "What do you see? (very quick answer)";
-                console.log('❓ Asking question:', simulatedQuestion);
-                setLastQuestion(simulatedQuestion);
+                // Use voice command if available, otherwise use fallback
+                const question = voiceCommand || lastQuestion || "What do you see? (very quick answer)";
+                console.log('❓ Asking question:', question);
+                setLastQuestion(question);
                 
                 console.log('🤖 Calling agent.answer...');
-                const answer = await agent.answer(simulatedQuestion);
+                const answer = await agent.answer(question);
                 console.log('✅ Agent answered successfully');
                 console.log('🎵 Direct answer from agent:', answer);
                 
-                // Play the response through chosen output
+                // Play the response through desktop speakers
                 if (answer) {
-                    if (audioOutputMode === 'mobile') {
-                        console.log('🔊 Sending TTS to mobile device...');
-                        await sendAudioToDevice(answer);
-                        console.log('✅ TTS sent to mobile device');
-                    } else {
-                        console.log('🔊 Playing TTS on desktop...');
-                        await textToSpeech(answer);
-                        console.log('✅ Desktop TTS completed');
-                    }
+                    console.log('🔊 Playing TTS on desktop speakers...');
+                    await textToSpeech(answer);
+                    console.log('✅ TTS played on desktop speakers');
                 } else {
                     console.log('⚠️ No answer returned from agent');
                 }
@@ -644,147 +1035,90 @@ export const DeviceView = React.memo((props: { device: BluetoothRemoteGATTServer
         }
     };
 
-    // Send audio data to mobile device via Bluetooth
-    const sendAudioToDevice = async (text: string) => {
+    // Process received audio from touch-activated recordings
+    const processReceivedAudio = async (audioBuffer: Uint8Array[]) => {
         try {
-            console.log('🎵 Generating TTS audio for mobile device...');
-            
-            // Get TTS audio data from Groq (but don't play it)
-            const response = await fetch("https://api.groq.com/openai/v1/audio/speech", {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${process.env.EXPO_PUBLIC_GROQ_API_KEY}`,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    model: "playai-tts-arabic",
-                    voice: "Ahmad-PlayAI", 
-                    response_format: "wav",
-                    input: text,
-                })
-            });
-
-            if (!response.ok) {
-                throw new Error(`TTS API failed: ${response.status}`);
+            console.log('🎵 Processing received audio, packets:', audioBuffer.length);
+             // Compute total payload length excluding 2-byte frame index per packet
+             const totalLength = audioBuffer.reduce((sum, chunk) => sum + Math.max(0, chunk.length - 2), 0);
+             console.log('🎵 Combined payload size (excluding headers):', totalLength, 'bytes');
+            if (totalLength === 0) { console.log('⚠️ No audio data payload, using default query'); setVoiceCommand('What do you see in this image?'); return; }
+            if (totalLength < 320) {
+                console.warn('⚠️ Extremely short audio (<10ms) - sending anyway, may get empty transcript');
             }
-
-            const audioArrayBuffer = await response.arrayBuffer();
-            const audioData = new Uint8Array(audioArrayBuffer);
-            console.log('✅ TTS audio generated:', audioData.length, 'bytes');
-
-            // Get the Bluetooth service and speaker characteristic
-            const service = await props.device.getPrimaryService('19b10000-e8f2-537e-4f6c-d104768a1214');
-            
-            // DISCOVER ALL AVAILABLE CHARACTERISTICS
-            console.log('🔍 Discovering all available characteristics...');
-            const allCharacteristics = await service.getCharacteristics();
-            console.log('📋 Available characteristics:');
-            allCharacteristics.forEach((char, index) => {
-                console.log(`  ${index + 1}. UUID: ${char.uuid}`);
-                console.log(`     Properties: write=${char.properties.write}, read=${char.properties.read}, notify=${char.properties.notify}`);
-            });
-            
-            // Try to find speaker characteristic
-            let speakerCharacteristic;
-            try {
-                speakerCharacteristic = await service.getCharacteristic('19b10003-e8f2-537e-4f6c-d104768a1214');
-                console.log('✅ Found speaker characteristic: 19b10003');
-            } catch (error) {
-                console.log('❌ Speaker characteristic 19b10003 not found');
-                
-                // Try alternative UUIDs that might be speaker-related
-                const alternativeUUIDs = [
-                    '19b10004-e8f2-537e-4f6c-d104768a1214',
-                    '19b10007-e8f2-537e-4f6c-d104768a1214',
-                    'cab1ab95-2ea5-4f4d-bb56-874b72cfc984', // From firmware speaker service
-                    'cab1ab96-2ea5-4f4d-bb56-874b72cfc984'  // Speaker haptic characteristic
-                ];
-                
-                for (const uuid of alternativeUUIDs) {
-                    try {
-                        const altChar = await service.getCharacteristic(uuid);
-                        console.log(`✅ Found alternative characteristic: ${uuid}`);
-                        if (altChar.properties.write) {
-                            console.log(`🎯 Using ${uuid} as speaker characteristic (has write property)`);
-                            speakerCharacteristic = altChar;
-                            break;
-                        }
-                    } catch (e) {
-                        console.log(`❌ Alternative UUID ${uuid} not found`);
-                    }
-                }
+             const combinedAudio = new Uint8Array(totalLength);
+             let offset = 0;
+             for (const chunk of audioBuffer) {
+                 if (chunk.length <= 2) continue;
+                 combinedAudio.set(chunk.slice(2), offset); // strip 2-byte frame index
+                 offset += chunk.length - 2;
+             }
+             // Convert to Int16 view
+             const pcmView = new Int16Array(combinedAudio.buffer, combinedAudio.byteOffset, Math.floor(combinedAudio.byteLength / 2));
+             const durationMs = (pcmView.length / 16); // samples /16 = ms @16kHz
+             console.log(`🎵 Prepared PCM samples=${pcmView.length} (~${durationMs.toFixed(0)}ms)`);
+            if (durationMs < 100) {
+                console.log('ℹ️ Very short duration (<100ms) – transcript quality may be poor');
             }
-            
-            if (!speakerCharacteristic) {
-                throw new Error('No speaker characteristic found - device may not support audio output');
+             setVoiceCommand('[transcribing touch audio...]');
+             let transcript = await transcribePcm16(pcmView, 16000);
+             if (!transcript || typeof transcript !== 'string' || !transcript.trim()) {
+                 transcript = 'What do you see?';
+             }
+             transcript = transcript.trim();
+             console.log('🎵 Touch audio transcript (Groq Whisper):', transcript);
+             setVoiceCommand(transcript);
+            if (touchActivationMode) {
+                console.log('👆 Touch mode: Processing audio command and photo...');
+                setIsWaitingForResponse(true);
+                setTimeout(() => { if (photos.length > 0) { processGlassesData(); } else { console.log('⏳ Waiting for photo to arrive after audio...'); } }, 500);
             }
-            
-            console.log('📱 Found speaker characteristic:', speakerCharacteristic.uuid);
-
-            // Send audio data in chunks (Bluetooth has MTU limitations)
-            const chunkSize = 400; // Max chunk size for audio packets based on firmware
-            const totalPackets = Math.ceil(audioData.length / chunkSize);
-            let offset = 0;
-            let packetNumber = 0;
-
-            console.log('📤 Audio transmission plan:');
-            console.log(`   Total audio size: ${audioData.length.toLocaleString()} bytes`);
-            console.log(`   Chunk size: ${chunkSize} bytes`);
-            console.log(`   Total packets: ${totalPackets.toLocaleString()}`);
-            console.log(`   Estimated time: ~${Math.ceil(totalPackets * 0.01)} seconds`);
-            console.log('📤 Starting transmission...');
-
-            while (offset < audioData.length) {
-                const chunk = audioData.slice(offset, offset + chunkSize);
-                
-                // Create packet with header (similar to how device sends audio to us)
-                const packet = new Uint8Array(chunk.length + 3);
-                packet[0] = packetNumber & 0xFF;         // Packet number low byte
-                packet[1] = (packetNumber >> 8) & 0xFF;  // Packet number high byte  
-                packet[2] = 0;                           // Chunk index within packet
-                packet.set(chunk, 3);                    // Audio data
-
-                await speakerCharacteristic.writeValue(packet);
-                
-                // Progress indicator every 100 packets
-                if (packetNumber % 100 === 0 || packetNumber === totalPackets - 1) {
-                    const progress = Math.round((packetNumber / totalPackets) * 100);
-                    console.log(`📦 Progress: ${packetNumber + 1}/${totalPackets} packets (${progress}%)`);
-                }
-                
-                offset += chunkSize;
-                packetNumber++;
-
-                // Small delay to avoid overwhelming the device
-                await new Promise(resolve => setTimeout(resolve, 10));
-            }
-
-            // Send end marker to signal audio transmission complete
-            const endMarker = new Uint8Array([0xFF, 0xFF]);
-            await speakerCharacteristic.writeValue(endMarker);
-            console.log('🏁 Audio transmission complete - end marker sent');
-
         } catch (error) {
-            console.error('❌ Error sending audio to device:', error);
-            // Fallback to desktop audio if mobile transmission fails
-            console.log('🔄 Falling back to desktop audio playback...');
-            try {
-                await textToSpeech(text);
-                console.log('✅ Desktop fallback audio completed');
-            } catch (fallbackError) {
-                console.error('❌ Desktop fallback also failed:', fallbackError);
-            }
+            console.error('❌ Error processing audio:', error);
+            setVoiceCommand('What do you see in this image?');
         }
     };
 
-    // Auto-process when new photos arrive (simulating audio+photo from glasses)
+    // Auto-process when new photos arrive (for both voice and touch activation)
     React.useEffect(() => {
-        console.log('📸 Photo effect triggered - isWaitingForResponse:', isWaitingForResponse, 'photos.length:', photos.length);
+        console.log('📸 Photo effect triggered - isWaitingForResponse:', isWaitingForResponse, 'photos.length:', photos.length, 'touchActivationMode:', touchActivationMode, 'isTouchWaiting:', isTouchWaiting);
+        
+        // Process photos for voice commands (existing behavior)
         if (isWaitingForResponse && photos.length > 0) {
-            console.log('🚀 Auto-triggering processGlassesData...');
-            processGlassesData();
+            console.log('🚀 Voice command active - processing fresh photo...');
+            console.log('🎤 This photo was captured because of voice command');
+            // Add small delay to prevent duplicate processing
+            setTimeout(() => {
+                if (isWaitingForResponse) { // Double-check state hasn't changed
+                    processGlassesData();
+                }
+            }, 100);
         }
-    }, [photos.length, isWaitingForResponse]);
+        // Process photos for touch activation (NEW: handle touch-activated photos)
+        else if (touchActivationMode && photos.length > 0 && !isWaitingForResponse) {
+            console.log('👆 Touch activation detected - processing touch-activated photo...');
+            console.log('📸 This photo was captured via touch sensor activation');
+            
+            // For touch activation, we need to simulate having a transcript
+            // Use a default question or the last transcript if available
+            const touchQuery = voiceCommand || "What do you see in this image?";
+            console.log('👆 Touch query:', touchQuery);
+            
+            // Set up state for processing
+            setIsWaitingForResponse(true);
+            setVoiceCommand(touchQuery);
+            
+            // Process immediately
+            setTimeout(() => {
+                processGlassesData();
+            }, 100);
+        }
+        // Legacy: photos without activation context
+        else if (photos.length > 0 && !isWaitingForResponse && !touchActivationMode) {
+            console.log('⚠️ Photo received but no voice command or touch activation active - ignoring old/cached data');
+            console.log('🎤 Photos should only be processed after "Lumina" wake word + voice command or touch activation');
+        }
+    }, [photos.length, touchActivationMode, isTouchWaiting]); // Add touch state dependencies
 
     // Background processing agent
     const processedPhotos = React.useRef<Uint8Array[]>([]);
@@ -911,8 +1245,186 @@ export const DeviceView = React.memo((props: { device: BluetoothRemoteGATTServer
                         </Text>
                     </Pressable>
                     
+                    {/* Voice Activation Button */}
+                    <Pressable
+                        onPress={toggleVoiceActivation}
+                        style={{
+                            backgroundColor: isListening ? '#f44336' : '#2196F3',
+                            padding: 12,
+                            borderRadius: 25,
+                            marginTop: 10,
+                            minWidth: 200,
+                            alignItems: 'center',
+                        }}
+                    >
+                        <Text style={{ color: 'white', fontSize: 14, fontWeight: 'bold' }}>
+                            {isListening ? '🛑 Stop Voice Activation' : '🎤 Start Voice Activation'}
+                        </Text>
+                        {isWaitingForCommand ? (
+                            <Text style={{ color: 'white', fontSize: 12, marginTop: 5 }}>
+                                💬 Listening for command...
+                            </Text>
+                        ) : null}
+                    </Pressable>
+
+                    {/* Touch Activation Button */}
+                    <Pressable
+                        onPress={toggleTouchActivation}
+                        style={{
+                            backgroundColor: touchActivationMode ? '#9C27B0' : '#607D8B',
+                            padding: 12,
+                            borderRadius: 25,
+                            marginTop: 10,
+                            minWidth: 200,
+                            alignItems: 'center',
+                        }}
+                    >
+                        <Text style={{ color: 'white', fontSize: 14, fontWeight: 'bold' }}>
+                            {touchActivationMode ? '🛑 Disable Touch Mode' : '👆 Enable Silence Detection Mode'}
+                        </Text>
+                    </Pressable>
+
+                    {/* Touch Activation Trigger (when touch mode is enabled) */}
+                    {touchActivationMode ? (
+                        <Pressable
+                            onPress={simulateTouchActivation}
+                            style={{
+                                backgroundColor: isTouchWaiting ? '#ff9800' : '#4CAF50',
+                                padding: 15,
+                                borderRadius: 25,
+                                marginTop: 10,
+                                minWidth: 200,
+                                alignItems: 'center',
+                                opacity: isTouchWaiting ? 0.8 : 1
+                            }}
+                        >
+                            <Text style={{ color: 'white', fontSize: 16, fontWeight: 'bold' }}>
+                                {isTouchWaiting ? '⏳ Recording until silence...' : '🔥 Touch to Record Until Silent'}
+                            </Text>
+                        </Pressable>
+                    ) : null}
+                    
+                    {/* Voice status display */}
+                    {(isListening || voiceCommand !== "") ? (
+                        <View style={{ marginTop: 10, padding: 10, backgroundColor: '#333', borderRadius: 10 }}>
+                            <Text style={{ color: 'white', fontSize: 12 }}>
+                                🎤 Status: {isListening ? 'Listening for "lumina"' : 'Stopped'}
+                            </Text>
+                            {voiceCommand ? (
+                                <Text style={{ color: '#4CAF50', fontSize: 12, marginTop: 5 }}>
+                                    Last command: "{voiceCommand}"
+                                </Text>
+                            ) : null}
+                        </View>
+                    ) : null}
+
+                    {/* Touch status display */}
+                    {touchActivationMode ? (
+                        <View style={{ marginTop: 10, padding: 10, backgroundColor: '#4A148C', borderRadius: 10 }}>
+                            <Text style={{ color: 'white', fontSize: 12 }}>
+                                👆 Touch Mode: {touchActivationMode ? 'Active' : 'Disabled'}
+                            </Text>
+                            {touchStatusMessage ? (
+                                <Text style={{ color: '#E1BEE7', fontSize: 12, marginTop: 5 }}>
+                                    Status: {touchStatusMessage}
+                                </Text>
+                            ) : null}
+                            <Text style={{ color: '#E1BEE7', fontSize: 11, marginTop: 5, fontStyle: 'italic' }}>
+                                Touch → Record until 1.5s silence → Auto photo → Processing
+                            </Text>
+                            <Text style={{ color: '#E1BEE7', fontSize: 11, marginTop: 2, fontStyle: 'italic' }}>
+                                More accessible - speak naturally, pause when done
+                            </Text>
+                        </View>
+                    ) : null}
+                    
+                    {/* Manual Process Button - for debugging */}
+                    {photos.length > 0 ? (
+                        <Pressable
+                            onPress={() => {
+                                console.log('🧪 Manual processing triggered');
+                                setIsWaitingForResponse(true);
+                                processGlassesData();
+                            }}
+                            style={{
+                                backgroundColor: '#2196F3',
+                                padding: 10,
+                                borderRadius: 20,
+                                marginTop: 10,
+                                minWidth: 180,
+                                alignItems: 'center'
+                            }}
+                        >
+                            <Text style={{ color: 'white', fontSize: 14, fontWeight: 'bold' }}>
+                                🧪 Process Latest Image ({photos.length} available)
+                            </Text>
+                        </Pressable>
+                    ) : null}
+                    
+                    {/* Device Reset Button - for transmission issues */}
+                    <Pressable
+                        onPress={async () => {
+                            console.log('🔄 Device reset triggered');
+                            try {
+                                const service = await props.device.getPrimaryService('19b10000-e8f2-537e-4f6c-d104768a1214');
+                                const photoControlCharacteristic = await service.getCharacteristic('19b10006-e8f2-537e-4f6c-d104768a1214');
+                                
+                                console.log('🛑 Sending STOP command...');
+                                const stopCommand = new Int8Array([0]);
+                                await photoControlCharacteristic.writeValue(stopCommand);
+                                console.log('✅ Device transmission stopped');
+                                console.log('💡 Device should reset and be ready for fresh capture');
+                            } catch (error) {
+                                console.error('❌ Reset failed:', error);
+                            }
+                        }}
+                        style={{
+                            backgroundColor: '#FF5722',
+                            padding: 10,
+                            borderRadius: 20,
+                            marginTop: 10,
+                            minWidth: 180,
+                            alignItems: 'center'
+                        }}
+                    >
+                        <Text style={{ color: 'white', fontSize: 14, fontWeight: 'bold' }}>
+                            🔄 Reset Device Transmission
+                        </Text>
+                    </Pressable>
+                    
+                    {/* Device Reset Instructions - when GATT fails */}
+                    {lastQuestion?.includes("Device reset required") ? (
+                        <View style={{
+                            marginTop: 15,
+                            padding: 15,
+                            backgroundColor: 'rgba(255, 87, 34, 0.2)',
+                            borderRadius: 10,
+                            borderLeftWidth: 4,
+                            borderLeftColor: '#FF5722'
+                        }}>
+                            <Text style={{ color: '#FF5722', fontSize: 14, fontWeight: 'bold' }}>
+                                🚨 Hardware Reset Required
+                            </Text>
+                            <Text style={{ color: 'white', fontSize: 12, marginTop: 8 }}>
+                                Device is in unstable state. Please:
+                            </Text>
+                            <Text style={{ color: 'white', fontSize: 11, marginTop: 5 }}>
+                                1. Unplug USB cable from XIAO ESP32S3
+                            </Text>
+                            <Text style={{ color: 'white', fontSize: 11 }}>
+                                2. Wait 5 seconds
+                            </Text>
+                            <Text style={{ color: 'white', fontSize: 11 }}>
+                                3. Plug back in
+                            </Text>
+                            <Text style={{ color: 'white', fontSize: 11 }}>
+                                4. Wait for "OMI Glass" to reconnect
+                            </Text>
+                        </View>
+                    ) : null}
+                    
                     {/* Current Status */}
-                    {lastQuestion ? (
+                    {lastQuestion !== "" && !lastQuestion.includes("Device reset required") ? (
                         <View style={{
                             marginTop: 10,
                             padding: 8,
@@ -930,8 +1442,11 @@ export const DeviceView = React.memo((props: { device: BluetoothRemoteGATTServer
                         </View>
                     ) : null}
                     
+                    
+                   
+                    
                     {/* AI Response Display */}
-                    {agentState?.answer ? (
+                    {agentState?.answer && agentState.answer !== "" ? (
                         <View style={{
                             marginTop: 15,
                             padding: 10,

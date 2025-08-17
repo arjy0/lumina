@@ -192,6 +192,11 @@ web-report/
 lefthook.yml
 omiGlass/.expo
 
+# PlatformIO
+.pio/
+*.pio
+**/.pio/
+
 # Logs
 /backend/logs/
 app/.fvm/
